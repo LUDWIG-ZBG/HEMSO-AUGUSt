@@ -1,0 +1,4394 @@
+%pip uninstall -y \
+  langgraph \
+  langgraph-prebuilt \
+  langgraph-checkpoint \
+  langgraph-sdk
+%pip install --no-cache-dir --upgrade \
+  "mlflow[databricks]>=3.1.3" \
+  "databricks-agents>=1.2.0" \
+  "langchain>=1.2.1,<2.0.0" \
+  "langchain-core>=1.2.1,<2.0.0" \
+  "langchain-community>=0.4.0,<0.5.0" \
+  "langgraph>=1.1.5,<2.0.0" \
+  "langgraph-prebuilt>=1.0.9,<2.0.0" \
+  "databricks-langchain" \
+  "databricks-vectorsearch" \
+  "databricks-sql-connector>=3.0.0" \
+  "pydantic>=2" \
+  "typing-extensions"
+
+dbutils.library.restartPython()
+import os
+
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+os.environ["DATABRICKS_SERVER_HOSTNAME"] = spark.conf.get(
+    "spark.databricks.workspaceUrl"
+)
+os.environ["DATABRICKS_HTTP_PATH"] = "/sql/1.0/warehouses/a64e09f01641a4aa"
+os.environ["DATABRICKS_TOKEN"] = ctx.apiToken().get()
+
+from importlib.metadata import version
+
+for pkg in [
+    "langgraph",
+    "langgraph-prebuilt",
+    "langgraph-checkpoint",
+    "langgraph-sdk",
+    "langchain",
+    "langchain-core",
+    "langchain-community",
+]:
+    print(pkg, version(pkg))
+
+from IPython.display import Image, display
+import uuid
+import json
+import re
+import unicodedata
+import ast
+import operator as op
+import operator
+from collections import defaultdict
+from pathlib import Path
+from difflib import SequenceMatcher
+from typing import Literal, Union, Any, Dict, List, Optional, Tuple
+from typing_extensions import TypedDict, Annotated
+
+import mlflow
+from mlflow.models import set_model
+from mlflow.pyfunc import ChatAgent
+from mlflow.types.agent import (
+    ChatAgentMessage,
+    ChatAgentResponse,
+    ChatAgentChunk,
+    ChatContext,
+)
+
+from pydantic import BaseModel, Field
+
+from langchain.tools import tool
+from langchain.messages import (
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    AnyMessage,
+    AIMessage,
+)
+from langgraph.graph import StateGraph, START, END
+
+from databricks import sql as dbsql
+from databricks_langchain import ChatDatabricks
+from databricks.vector_search.client import VectorSearchClient
+from databricks.vector_search.reranker import DatabricksReranker
+from databricks.vector_search.utils import CredentialStrategy
+# 0) pre-setup 
+# 
+# Navigation helpers
+def empty_navigation_memory() -> Dict[str, Any]:
+    return {
+        "searches": [],      # recent similarity_search queries
+        "elements": {},      # element_id -> compact metadata
+        "sheets": {},        # element_id -> sheet labels/profile
+        "neighbours": {},    # seed_element_id -> neighbour ids
+    }
+
+
+def _cap_dict(d: Dict[str, Any], max_items: int) -> Dict[str, Any]:
+    if not d:
+        return {}
+    return dict(list(d.items())[-max_items:])
+
+
+def _dedupe_recent_searches(searches: List[Dict[str, Any]], max_items: int = 12) -> List[Dict[str, Any]]:
+    out_reversed = []
+    seen = set()
+
+    for item in reversed(searches or []):
+        if not isinstance(item, dict):
+            continue
+
+        key = (
+            item.get("tool"),
+            item.get("query_text"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out_reversed.append(item)
+
+    return list(reversed(out_reversed))[-max_items:]
+
+
+
+# Class and state Helpers
+def merge_navigation_memory(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Reducer for LangGraph state.
+    Keeps navigation memory small and deterministic.
+    This is NOT evidence; it is only for choosing future tool calls.
+    """
+    left = left or {}
+    right = right or {}
+
+    searches = (
+        list(left.get("searches", []) or [])
+        + list(right.get("searches", []) or [])
+    )
+
+    elements = {
+        **(left.get("elements", {}) or {}),
+        **(right.get("elements", {}) or {}),
+    }
+
+    sheets = {
+        **(left.get("sheets", {}) or {}),
+        **(right.get("sheets", {}) or {}),
+    }
+
+    neighbours = {
+        **(left.get("neighbours", {}) or {}),
+        **(right.get("neighbours", {}) or {}),
+    }
+
+    return {
+        "searches": _dedupe_recent_searches(searches, max_items=12),
+        "elements": _cap_dict(elements, max_items=40),
+        "sheets": _cap_dict(sheets, max_items=12),
+        "neighbours": _cap_dict(neighbours, max_items=20),
+    }
+
+
+# 1) Classes
+
+# Tool Observations
+class SourceRef(BaseModel):
+    doc_id: str
+    element_id: str
+    page: Optional[int] = None
+    element_type: Optional[str] = None
+
+class ToolResponse(BaseModel):
+    tool: str
+    status: str
+    message: str
+    data: List[Dict[str, Any]] = Field(default_factory=list)
+    sources: List[SourceRef] = Field(default_factory=list)
+
+class EvidenceItem(BaseModel):
+    evidence_id: str   
+    source: SourceRef
+    context: str     
+    tool: str
+    structured_data: Optional[Dict[str, Any]] = None      
+    used_in_answer: bool = False
+
+class QueryPlan(BaseModel):
+    original_query: str = Field(
+        default="", description="Användarens ursprungliga fråga.")
+    rewritten_query: str = Field(
+        default="", description= "Optimera frågan för en 'Financial Due Dilligence Evidence Researcher', utan att ändra användarens intention.")
+    task_type: str = Field(
+        default="", description="Klassificera uppgiften som en eller flera av följande: sökning, jämförelse, beräkning, sammanfattning, konflikt identifiering, risk identifiering, blandat.")
+    search_terms: List[str] = Field(    #
+        default_factory=list, description="Sökfraser som passar similarity search.")
+    answer_criteria: List[str] = Field(
+        default_factory=list, description="Vad som måste hittas i underlaget för att frågan ska kunna besvaras väl.")
+    
+# tools
+
+# Håller koll på historik av tool användning
+class ToolObservation(BaseModel):
+    tool: str
+    status: str
+    message: str
+    tool_args: Dict[str, Any] = Field(default_factory=dict)
+    result_count: int = 0
+    source_refs: List[str] = Field(default_factory=list)
+
+# Format för att presentera tool resultat för task-handler
+class ToolResultRecord(BaseModel):
+    tool: str
+    status: Literal["Ok", "No", "ERROR", "BLOCKED"]
+    message: str
+    data: List[Dict[str, Any]] = Field(default_factory=list)
+    sources: List[SourceRef] = Field(default_factory=list)
+    tool_args: Dict[str, Any] = Field(default_factory=dict)
+
+    result_kind: Literal["navigation", "evidence", "meta", "mixed"] = "meta"
+    evidence_candidate: bool = False
+    result_count: int = 0
+
+# Krav-lista
+class CriterionFinding(BaseModel):
+    criterion: str
+    status: Literal["Uppfyllt", "Ej uppfyllt", "Konflikt", "Relevant"]
+    motivation: str
+    supporting_evidence_ids: List[str] = Field(default_factory=list)
+
+class CriteriaReviewResult(BaseModel):
+    findings: List[CriterionFinding] = Field(default_factory=list)
+
+# Multi Final Answer
+class MultiFinalAnswer(BaseModel):
+    Answer: str
+    Review: List[CriterionFinding] = Field(default_factory=list)
+    EvidenceTrail: List[EvidenceItem] = Field(default_factory=list)
+    query_plan: Optional[QueryPlan] = None
+
+class MultiAugustState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+
+    # Query planing
+    user_query: str
+    query_plan: Dict[str, Any]
+
+    # Task handler information handling
+    tool_observations: Annotated[list[Dict[str, Any]], operator.add]
+    latest_tool_results: List[ToolResultRecord]
+    navigation_memory: Annotated[Dict[str, Any], merge_navigation_memory]
+
+    # Evidence gathering
+    evidence_items: Annotated[list[EvidenceItem], operator.add]
+    no_new_evidence_iterations: int
+
+    # Finalization
+    ready_to_finalize: bool
+    final_output: Dict[str, Any]
+
+
+# Single State
+class SingleAugustState(TypedDict):
+    query: str
+    messages: Annotated[list[AnyMessage], operator.add]
+    sources: List[SourceRef]
+    evidence_items: Annotated[list[EvidenceItem], operator.add]
+    final_output: Dict[str, Any]
+
+# SingleFinal Answer
+class SingleFinalAnswer(BaseModel):
+    Answer: str = Field(
+        description="Besvara användarens fråga enbart med stöd i datarummet. Om underlag saknas, säg det tydligt."
+    )
+    Sources: List[SourceRef] = Field(default_factory=list)
+    EvidenceTrail: List[EvidenceItem] = Field(default_factory=list)
+# 2) Setup and helpers
+
+delta_table = "dev.acquisition_intelligence.rag_delta"
+VectorSearchIndex = "dev.acquisition_intelligence.fdd_vector_idx"
+
+# Setup LLM model endpoint
+ME_list = []
+ME1 = "databricks-claude-sonnet-4-6"   # example from Databricks docs
+ME2 = "databricks-claude-opus-4-8"
+ME3 = "databricks-claude-haiku-4-5"
+ME4 = "databricks-gemma-3-12b"   # example from Databricks docs
+ME5 = "databricks-gpt-oss-120b"
+ME6 = "databricks-gpt-oss-20b"
+ME7 ="databricks-llama-4-maverick"
+ME8 = "databricks-claude-opus-4-7"
+ME_list.extend([ME1, ME2, ME3, ME4, ME5, ME6, ME7, ME8])
+
+# MODEL_ENDPOINT = ME_list[6]
+
+# Chat model handle
+# Query planer
+llm1 = ChatDatabricks(
+    endpoint= ME_list[1],
+    temperature=0.0,
+    max_tokens=512,
+    stream_usage=True,
+)
+# Task Handler & Answer
+llm2 = ChatDatabricks(
+    endpoint= ME_list[1],
+    temperature=0.0,
+    max_tokens=600,
+    stream_usage=True,
+)
+# Answer LLM
+llm3 = ChatDatabricks(
+    endpoint= ME_list[1],
+    temperature=0.0,
+    max_tokens=2500,
+    stream_usage=True,
+)
+# Review LLM
+llm4 = ChatDatabricks(
+    endpoint= ME_list[1],
+    temperature=0.2,
+    max_tokens=800,
+    stream_usage=True,
+)
+
+# Single August
+llm5 = ChatDatabricks(
+    endpoint= ME_list[1],
+    #temperature=0.05,
+    max_tokens=2500,
+    stream_usage=True,
+)
+
+# You must fill this in from your SQL Warehouse connection details
+DATABRICKS_SERVER_HOSTNAME = os.getenv("DATABRICKS_SERVER_HOSTNAME")
+DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+
+# DBSQL helpers
+
+# DBSQL retrival helpers
+def _validate_uc_table_name(table_name: str) -> str:
+    """
+    Minimal safety check because table names cannot be parameterized.
+    Allows catalog.schema.table.
+    """
+    table_name = str(table_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+", table_name):
+        raise ValueError(f"Invalid Unity Catalog table name: {table_name}")
+    return table_name
+
+DBSQL_TABLE = _validate_uc_table_name(delta_table)
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+
+    if value is None or not str(value).strip():
+        raise RuntimeError(
+            f"Missing environment variable: {name}. "
+            "Set DATABRICKS_SERVER_HOSTNAME, DATABRICKS_HTTP_PATH, "
+            "and DATABRICKS_TOKEN before using DBSQL-backed tools."
+        )
+
+    return str(value).strip()
+
+
+def _dbsql_connect():
+    return dbsql.connect(
+        server_hostname=DATABRICKS_SERVER_HOSTNAME,
+        http_path=DATABRICKS_HTTP_PATH,
+        access_token=_required_env("DATABRICKS_TOKEN"),
+    )
+
+def dbsql_fetch_all(query: str, params: list | tuple | None = None) -> list[dict]:
+    try:
+        with _dbsql_connect() as conn:
+            with conn.cursor() as cur:
+                if params is None:
+                    cur.execute(query)
+                else:
+                    cur.execute(query, list(params))
+
+                rows = cur.fetchall()
+                cols = [c[0] for c in cur.description]
+                return [dict(zip(cols, row)) for row in rows]
+
+    except Exception as e:
+        print("DBSQL connection failed.")
+        print("DATABRICKS_SERVER_HOSTNAME:", os.getenv("DATABRICKS_SERVER_HOSTNAME"))
+        print("DATABRICKS_HTTP_PATH:", os.getenv("DATABRICKS_HTTP_PATH"))
+        print("DATABRICKS_TOKEN set:", bool(os.getenv("DATABRICKS_TOKEN")))
+        print("Query:", query)
+        print("Params:", params)
+        raise e
+
+# Setup LLM model endpoint
+ME_list = []
+ME1 = "databricks-claude-sonnet-4-6"   # example from Databricks docs
+ME2 = "databricks-claude-opus-4-6"
+ME3 = "databricks-claude-haiku-4-5"
+ME4 = "databricks-gemma-3-12b"   # example from Databricks docs
+ME5 = "databricks-gpt-oss-120b"
+ME6 = "databricks-gpt-oss-20b"
+ME7 ="databricks-llama-4-maverick"
+ME8 = "databricks-claude-opus-4-7"
+ME_list.extend([ME1, ME2, ME3, ME4, ME5, ME6, ME7, ME8])
+
+# MODEL_ENDPOINT = ME_list[6]
+
+# Chat model handle
+# Query planer
+llm1 = ChatDatabricks(
+    endpoint= ME_list[2],
+    temperature=0.0,
+    max_tokens=512,
+    stream_usage=True,
+)
+# Task Handler & Answer
+llm2 = ChatDatabricks(
+    endpoint= ME_list[0],
+    temperature=0.0,
+    max_tokens=600,
+    stream_usage=True,
+)
+# Answer LLM
+llm3 = ChatDatabricks(
+    endpoint= ME_list[1],
+    temperature=0.0,
+    max_tokens=2500,
+    stream_usage=True,
+)
+# Review LLM
+llm4 = ChatDatabricks(
+    endpoint= ME_list[2],
+    temperature=0.2,
+    max_tokens=800,
+    stream_usage=True,
+)
+
+# Single August
+llm5 = ChatDatabricks(
+    endpoint= ME_list[1],
+    #temperature=0.05,
+    max_tokens=2500,
+    stream_usage=True,
+)
+
+# Helpers Calculation
+def multiply(a: int, b: int) -> float:
+    return a * b
+
+def divide(a: int, b: int) -> float:
+    return a / b
+
+# Others
+def _placeholders(values: list[Any]) -> str:
+    return ", ".join(["?"] * len(values))
+
+
+def _as_bbox_list(value):
+    """
+    Keeps bbox handling stable whether DBSQL returns ARRAY, tuple, list, or JSON string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return list(parsed) if isinstance(parsed, (list, tuple)) else None
+        except Exception:
+            return None
+    try:
+        return list(value)
+    except Exception:
+        return None
+
+# Query Planner helpers
+# Normalizera lista
+def _normalize_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, list):
+        return []
+
+    out = []
+    seen = set()
+
+    for item in value:
+        s = str(item).strip()
+        if not s:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    return out
+
+# Task handler
+def compact_evidence_for_llm(e: EvidenceItem, max_len: int = 700) -> str:
+    """
+    Compact representation of evidence for the task handler.
+    Keeps enough context for routing decisions without sending full raw clauses/tables.
+    """
+    if isinstance(e, dict):
+        e = EvidenceItem(**e)
+
+    doc_name = Path(str(e.source.doc_id or "")).name
+
+    return (
+        f"[{e.evidence_id}] "
+        f"{doc_name} | "
+        f"element={e.source.element_id} | "
+        f"page={e.source.page} | "
+        f"type={e.source.element_type} | "
+        f"tool={e.tool}\n"
+        f"{shorten_text(e.context, max_len)}"
+    )
+
+def _shorten_list(values, max_items=80, max_item_len=80):
+    out = []
+    for v in values or []:
+        s = str(v).strip()
+        if not s:
+            continue
+        if len(s) > max_item_len:
+            s = s[:max_item_len].rstrip() + "..."
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+def compact_tool_result_for_llm(r: ToolResultRecord, max_items: int = 5) -> Dict[str, Any]:
+    if r.tool == "sheet_labels":
+        return {
+            "tool": r.tool,
+            "status": r.status,
+            "message": shorten_text(r.message, 500),
+            "result_kind": r.result_kind,
+            "evidence_candidate": r.evidence_candidate,
+            "result_count": r.result_count,
+            "tool_args": r.tool_args,
+            "sources": [
+                {
+                    "doc_id": s.doc_id,
+                    "element_id": s.element_id,
+                    "page": s.page,
+                    "element_type": s.element_type,
+                }
+                for s in r.sources[:max_items]
+            ],
+            "data_preview": [
+                {
+                    "sheet_name": item.get("sheet_name"),
+                    "sheet_nr": item.get("sheet_nr"),
+                    "row_labels": _shorten_list(item.get("row_labels"), max_items=120),
+                    "column_labels": _shorten_list(item.get("column_labels"), max_items=80),
+                    "target_labels": shorten_text(item.get("target_labels"), 3000),
+                }
+                for item in r.data[:1]
+            ],
+        }
+
+    return {
+        "tool": r.tool,
+        "status": r.status,
+        "message": shorten_text(r.message, 300),
+        "result_kind": r.result_kind,
+        "evidence_candidate": r.evidence_candidate,
+        "result_count": r.result_count,
+        "tool_args": r.tool_args,
+        "sources": [
+            {
+                "doc_id": s.doc_id,
+                "element_id": s.element_id,
+                "page": s.page,
+                "element_type": s.element_type,
+            }
+            for s in r.sources[:max_items]
+        ],
+        "data_preview": [
+            {
+                k: shorten_text(v, 200)
+                for k, v in item.items()
+                if k in {
+                    "doc_id", "element_id", "page", "element_type",
+                    "summary_text", "row_label", "column_label", "Value",
+                    "Value_num", "Row", "Column", "Column_letter",
+                    "match_type", "matched_labels",
+                }
+            }
+            for item in r.data[:max_items]
+        ],
+    }
+
+
+def compact_state_for_task_handler(
+    state: MultiAugustState,
+    user_query: str,
+    query_plan: QueryPlan,
+    latest_tool_results: List[ToolResultRecord],
+    evidence_items: List[EvidenceItem],
+) -> Dict[str, Any]:
+    recent_observations = (state.get("tool_observations", []) or [])[-6:]
+
+    return {
+        "user_query": user_query,
+        "query_plan": {
+            "original_query": query_plan.original_query,
+            "rewritten_query": query_plan.rewritten_query,
+            "task_type": query_plan.task_type,
+            "search_terms": query_plan.search_terms[:5],
+            "answer_criteria": query_plan.answer_criteria[:5],
+        },
+        "recent_observations": recent_observations,
+        "latest_tool_results": [
+            compact_tool_result_for_llm(r)
+            for r in latest_tool_results[:3]
+        ],
+        "evidence": [
+            compact_evidence_for_llm(e, 500)
+            for e in evidence_items[-8:]
+        ] or ["Ingen sparad evidens ännu."],
+    }
+
+def _normalize_tool_status(value: Any) -> Literal["Ok", "No", "ERROR", "BLOCKED"]:
+    s = str(value or "").strip()
+
+    if s in {"Ok", "No", "ERROR", "BLOCKED"}:
+        return s
+
+    if s in {"Inga resultat hittades", "No results", "Not found"}:
+        return "No"
+
+    return "ERROR"
+
+
+def _normalize_tool_result_records(items: List[Any]) -> List[ToolResultRecord]:
+    out = []
+
+    for item in items or []:
+        if isinstance(item, ToolResultRecord):
+            out.append(item)
+        elif isinstance(item, dict):
+            out.append(ToolResultRecord(**item))
+
+    return out
+
+TOOL_RESULT_KIND = {
+    "similarity_search": ("navigation", False),
+    "find_neighbours":   ("navigation", False),
+    "sheet_labels":      ("meta", False),
+    "clause_lookup":     ("evidence", True),
+    "sheet_lookup":      ("evidence", True),
+}
+
+def build_evidence_from_tool_result(
+    tool_result: ToolResultRecord,
+    existing_items: List[EvidenceItem],
+) -> List[EvidenceItem]:
+    if not tool_result.evidence_candidate:
+        return []
+
+    out = []
+
+    tool_name = tool_result.tool
+    data = tool_result.data
+    sources = tool_result.sources
+
+    next_id_num = len(existing_items) + 1
+    evidence_offset = 0
+
+    for item in data:
+        source = None
+        context = ""
+        structured_data = None
+
+        if tool_name == "clause_lookup":
+            content = str(item.get("content", "") or "").strip()
+            if not content:
+                continue
+
+            source = SourceRef(
+                doc_id=item.get("doc_id"),
+                element_id=item.get("element_id"),
+                page=item.get("page"),
+                element_type=item.get("element_type"),
+            )
+
+            context = content
+            structured_data = {
+                "element_type": item.get("element_type"),
+            }
+
+        elif tool_name == "sheet_lookup":
+            value = item.get("Value")
+            row_label = item.get("row_label")
+            column_label = item.get("column_label")
+
+            if value is None and not row_label and not column_label:
+                continue
+
+            first_source = sources[0] if sources else None
+            if isinstance(first_source, dict):
+                source = SourceRef(**first_source)
+            else:
+                source = first_source
+
+            if not source:
+                continue
+
+            context = f"Value '{value}' for row '{row_label}' and column '{column_label}'."
+            structured_data = item
+
+        else:
+            continue
+
+        out.append(
+            EvidenceItem(
+                evidence_id=f"E{next_id_num + evidence_offset}",
+                source=source,
+                context=context,
+                tool=tool_name,
+                structured_data=structured_data,
+            )
+        )
+        evidence_offset += 1
+
+    return out
+
+
+def _collect_new_evidence_from_tool_results(
+    tool_results: List[Any],
+    existing_items: List[EvidenceItem],
+) -> List[EvidenceItem]:
+    existing_items = _normalize_evidence_items(existing_items)
+    tool_results = _normalize_tool_result_records(tool_results)
+
+    seen = {_evidence_key(e) for e in existing_items}
+
+    working_existing = list(existing_items)
+    new_items = []
+
+    for result in tool_results:
+        try:
+            candidates = build_evidence_from_tool_result(result, working_existing)
+        except Exception as e:
+            print("Evidence build failed:", repr(e))
+            continue
+
+        for candidate in candidates:
+            key = _evidence_key(candidate)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            new_items.append(candidate)
+            working_existing.append(candidate)
+
+    return new_items
+
+def _coerce_query_plan(state: MultiAugustState) -> QueryPlan:
+    raw_plan = state.get("query_plan") or {}
+    user_query = state.get("user_query", "") or ""
+
+    if isinstance(raw_plan, QueryPlan):
+        return raw_plan
+
+    if isinstance(raw_plan, dict):
+        try:
+            return QueryPlan(**raw_plan)
+        except Exception:
+            pass
+
+    return QueryPlan(
+        original_query=user_query,
+        rewritten_query=user_query,
+        task_type="blandat",
+        search_terms=[user_query] if user_query else [],
+        answer_criteria=[],
+    )
+
+
+def _normalize_evidence_items(items: List[Any]) -> List[EvidenceItem]:
+    out = []
+    for item in items or []:
+        if isinstance(item, EvidenceItem):
+            out.append(item)
+        elif isinstance(item, dict):
+            out.append(EvidenceItem(**item))
+    return out
+
+
+def _evidence_key(e: EvidenceItem) -> tuple:
+    return (
+        e.source.doc_id,
+        e.source.element_id,
+        e.source.page,
+        e.tool,
+        e.context.strip(),
+    )
+
+# Tool Node
+
+# For navigation memory
+def _source_ref_to_dict(source: Any) -> Dict[str, Any]:
+    if source is None:
+        return {}
+
+    if isinstance(source, dict):
+        return {
+            "doc_id": source.get("doc_id"),
+            "element_id": source.get("element_id"),
+            "page": source.get("page"),
+            "element_type": source.get("element_type"),
+        }
+
+    return {
+        "doc_id": getattr(source, "doc_id", None),
+        "element_id": getattr(source, "element_id", None),
+        "page": getattr(source, "page", None),
+        "element_type": getattr(source, "element_type", None),
+    }
+
+
+def build_navigation_memory_update(result: ToolResultRecord) -> Dict[str, Any]:
+    update = empty_navigation_memory()
+
+    if not isinstance(result, ToolResultRecord):
+        return update
+
+    if result.status != "Ok":
+        return update
+
+    if result.tool == "similarity_search":
+        query_text = str(result.tool_args.get("query_text") or "").strip()
+
+        top_element_ids = [
+            item.get("element_id")
+            for item in result.data[:4]
+            if item.get("element_id")
+        ]
+
+        update["searches"].append({
+            "tool": "similarity_search",
+            "query_text": query_text,
+            "result_count": result.result_count,
+            "top_element_ids": top_element_ids,
+        })
+
+        for rank, item in enumerate(result.data[:4], start=1):
+            element_id = item.get("element_id")
+            if not element_id:
+                continue
+
+            update["elements"][element_id] = {
+                "doc_id": item.get("doc_id"),
+                "element_id": element_id,
+                "page": item.get("page"),
+                "element_type": item.get("element_type"),
+                "file_type": infer_file_type(item.get("doc_id")),
+                "found_by": "similarity_search",
+                "query_text": query_text,
+                "rank": rank,
+                "summary_hint": shorten_text(item.get("summary_text"), 250),
+            }
+
+        return update
+
+    if result.tool == "sheet_labels":
+        if not result.data:
+            return update
+
+        source = _source_ref_to_dict(result.sources[0] if result.sources else None)
+        element_id = result.tool_args.get("element_id") or source.get("element_id")
+        if not element_id:
+            return update
+
+        item = result.data[0]
+
+        row_labels = _shorten_list(item.get("row_labels", []), max_items=160, max_item_len=100)
+        column_labels = _shorten_list(item.get("column_labels", []), max_items=80, max_item_len=100)
+
+        update["sheets"][element_id] = {
+            "doc_id": source.get("doc_id"),
+            "element_id": element_id,
+            "page": source.get("page"),
+            "element_type": source.get("element_type"),
+            "sheet_name": item.get("sheet_name"),
+            "sheet_nr": item.get("sheet_nr"),
+            "row_labels": row_labels,
+            "column_labels": column_labels,
+        }
+
+        update["elements"][element_id] = {
+            "doc_id": source.get("doc_id"),
+            "element_id": element_id,
+            "page": source.get("page"),
+            "element_type": source.get("element_type"),
+            "file_type": infer_file_type(source.get("doc_id")),
+            "found_by": "sheet_labels",
+            "summary_hint": f"Sheet profile: {len(row_labels)} row labels, {len(column_labels)} column labels.",
+        }
+
+        return update
+
+    if result.tool == "find_neighbours":
+        seed_element_id = str(result.tool_args.get("element_id") or "").strip()
+        eps = result.tool_args.get("eps")
+
+        neighbour_ids = [
+            item.get("element_id")
+            for item in result.data
+            if item.get("element_id")
+        ]
+
+        if seed_element_id:
+            update["neighbours"][seed_element_id] = {
+                "seed_element_id": seed_element_id,
+                "eps": eps,
+                "neighbour_element_ids": neighbour_ids[:30],
+                "count": len(neighbour_ids),
+            }
+
+        for source in result.sources[:30]:
+            s = _source_ref_to_dict(source)
+            element_id = s.get("element_id")
+            if not element_id:
+                continue
+
+            update["elements"][element_id] = {
+                "doc_id": s.get("doc_id"),
+                "element_id": element_id,
+                "page": s.get("page"),
+                "element_type": s.get("element_type"),
+                "file_type": infer_file_type(s.get("doc_id")),
+                "found_by": "find_neighbours",
+                "neighbour_of": seed_element_id,
+            }
+
+        return update
+
+    return update
+
+
+def compact_navigation_memory_for_llm(nav: Dict[str, Any]) -> str:
+    nav = nav or {}
+
+    sheets = {}
+    for element_id, sheet in (nav.get("sheets", {}) or {}).items():
+        sheets[element_id] = {
+            "doc_id": sheet.get("doc_id"),
+            "element_id": sheet.get("element_id"),
+            "page": sheet.get("page"),
+            "element_type": sheet.get("element_type"),
+            "sheet_name": sheet.get("sheet_name"),
+            "sheet_nr": sheet.get("sheet_nr"),
+            "row_labels": _shorten_list(sheet.get("row_labels"), max_items=100, max_item_len=80),
+            "column_labels": _shorten_list(sheet.get("column_labels"), max_items=60, max_item_len=80),
+        }
+
+    payload = {
+        "recent_searches": (nav.get("searches", []) or [])[-8:],
+        "known_elements": list((nav.get("elements", {}) or {}).values())[-16:],
+        "known_sheets": sheets,
+        "known_neighbours": list((nav.get("neighbours", {}) or {}).values())[-8:],
+    }
+
+    return shorten_text(json.dumps(payload, ensure_ascii=False, default=str), 10000)
+
+
+def _make_source_ref_strings(sources: List[Any]) -> List[str]:
+    out = []
+    seen = set()
+
+    for s in sources or []:
+        if isinstance(s, dict):
+            doc_id = s.get("doc_id")
+            element_id = s.get("element_id")
+            page = s.get("page")
+            element_type = s.get("element_type")
+        else:
+            doc_id = getattr(s, "doc_id", None)
+            element_id = getattr(s, "element_id", None)
+            page = getattr(s, "page", None)
+            element_type = getattr(s, "element_type", None)
+
+        ref = f"{doc_id}|{element_id}|{page}|{element_type}"
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+
+    return out
+
+
+def build_compact_tool_observation(
+    raw_observation: Dict[str, Any],
+    tool_name: str,
+    tool_args: Dict[str, Any],
+) -> ToolObservation:
+    data = raw_observation.get("data", []) or []
+    sources = raw_observation.get("sources", []) or []
+
+    return ToolObservation(
+        tool=tool_name,
+        status=str(raw_observation.get("status", "") or ""),
+        message=str(raw_observation.get("message", "") or ""),
+        tool_args=tool_args,
+        result_count=len(data),
+        source_refs=_make_source_ref_strings(sources),
+    )
+
+def normalize_raw_tool_result(
+    raw_observation: Dict[str, Any],
+    tool_name: str,
+    tool_args: Dict[str, Any],
+) -> ToolResultRecord:
+    result_kind, evidence_candidate = TOOL_RESULT_KIND.get(tool_name, ("meta", False))
+
+    data = raw_observation.get("data", []) or []
+    sources = [
+        SourceRef(**s) if isinstance(s, dict) else s
+        for s in (raw_observation.get("sources", []) or [])
+    ]
+
+    return ToolResultRecord(
+        tool=tool_name,
+        status=_normalize_tool_status(raw_observation.get("status", "")),
+        message=str(raw_observation.get("message", "") or ""),
+        data=data,
+        sources=sources,
+        tool_args=tool_args,
+        result_kind=result_kind,
+        evidence_candidate=evidence_candidate,
+        result_count=len(data),
+    )
+
+
+def _normalize_tool_args_for_signature(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+    if tool_name == "similarity_search":
+        q = str(tool_args.get("query_text", "")).strip().lower()
+        q = re.sub(r"\s+", " ", q)
+        return {"query_text": q}
+
+    if tool_name == "clause_lookup":
+        ids = tool_args.get("element_id", [])
+        if isinstance(ids, str):
+            ids = [ids]
+        ids = sorted({str(x).strip() for x in ids if str(x).strip()})
+        return {"element_id": ids}
+
+    if tool_name == "sheet_lookup":
+        labels = tool_args.get("target_labels", [])
+        if isinstance(labels, str):
+            labels = [labels]
+        labels = sorted({str(x).strip().lower() for x in labels if str(x).strip()})
+        return {
+            "element_id": str(tool_args.get("element_id", "")).strip(),
+            "target_labels": labels,
+        }
+
+    if tool_name == "find_neighbours":
+        return {
+            "element_id": str(tool_args.get("element_id", "")).strip(),
+            "eps": int(tool_args.get("eps", 0)),
+        }
+
+    return tool_args
+
+
+def _tool_signature(tool_name: str, tool_args: Dict[str, Any]) -> str:
+    normalized = _normalize_tool_args_for_signature(tool_name, tool_args)
+    return f"{tool_name}::{json.dumps(normalized, ensure_ascii=False, sort_keys=True)}"
+
+def validate_or_route_tool_call(
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    state: MultiAugustState,
+) -> Tuple[str, Dict[str, Any], Optional[ToolObservation]]:
+    qp = _coerce_query_plan(state)
+
+    # clause_lookup
+    if tool_name == "clause_lookup":
+        element_ids = tool_args.get("element_id", [])
+        if isinstance(element_ids, str):
+            element_ids = [element_ids]
+
+        meta = get_element_metadata(element_ids)
+
+        missing_ids = [eid for eid in element_ids if eid not in meta]
+        if missing_ids:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"Metadata saknas för element_id: {missing_ids}",
+                tool_args=tool_args,
+            )
+
+        non_pdf = [eid for eid, m in meta.items() if m["file_type"] != "pdf"]
+        if non_pdf:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"clause_lookup får endast användas för .pdf. Fel element_id: {non_pdf}",
+                tool_args=tool_args,
+            )
+
+        return tool_name, tool_args, None
+
+    # sheet_labels
+    if tool_name == "sheet_labels":
+        element_id = tool_args.get("element_id")
+        meta = get_element_metadata([element_id]).get(element_id)
+
+        if not meta:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"Metadata saknas för element_id: {element_id}",
+                tool_args=tool_args,
+            )
+
+        if meta["file_type"] not in {"xlsx", "xls"}:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"sheet_labels får endast användas för .xlsx/.xls. element_id={element_id} tillhör {meta['file_type']}",
+                tool_args=tool_args,
+            )
+
+        normalized_args = {
+            "element_id": element_id,
+        }
+        return tool_name, normalized_args, None
+
+    # sheet_lookup
+    if tool_name == "sheet_lookup":
+        element_id = tool_args.get("element_id")
+        meta = get_element_metadata([element_id]).get(element_id)
+
+        if not meta:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"Metadata saknas för element_id: {element_id}",
+                tool_args=tool_args,
+            )
+
+        if meta["file_type"] not in {"xlsx", "xls"}:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message=f"sheet_lookup får endast användas för .xlsx/.xls. element_id={element_id} tillhör {meta['file_type']}",
+                tool_args=tool_args,
+            )
+
+        target_labels = tool_args.get("target_labels") # or qp.target_labels
+        if not target_labels:
+            return tool_name, tool_args, ToolObservation(
+                tool=tool_name,
+                status="ERROR",
+                message="sheet_lookup kräver target_labels. Inga target_labels fanns i tool_args eller query_plan.",
+                tool_args=tool_args,
+            )
+
+        normalized_args = {
+            "element_id": element_id,
+            "target_labels": target_labels,
+        }
+        return tool_name, normalized_args, None
+
+    return tool_name, tool_args, None
+
+def infer_file_type(doc_id: Optional[str]) -> str:
+    return Path(str(doc_id or "")).suffix.lower().lstrip(".")
+
+def get_element_metadata(element_ids: Union[str, List[str]]) -> Dict[str, Dict[str, Any]]:
+    if isinstance(element_ids, str):
+        element_ids = [element_ids]
+
+    element_ids = [str(x).strip() for x in (element_ids or []) if str(x).strip()]
+    if not element_ids:
+        return {}
+
+    query = f"""
+        SELECT
+            doc_id,
+            element_id,
+            page,
+            element_type
+        FROM {DBSQL_TABLE}
+        WHERE element_id IN ({_placeholders(element_ids)})
+    """
+
+    rows = dbsql_fetch_all(query, element_ids)
+
+    out = {}
+    for row in rows:
+        doc_id = row["doc_id"]
+        out[row["element_id"]] = {
+            "doc_id": doc_id,
+            "page": row["page"],
+            "element_type": row["element_type"],
+            "file_type": infer_file_type(doc_id),
+        }
+
+    return out
+
+# Finalizer helpers
+def extract_final_text(response_or_content: Any) -> str:
+    """
+    Returnerar endast den användarsynliga sluttexten från ett modell-svar.
+
+    Hanterar:
+    - AIMessage med .content
+    - vanlig sträng
+    - lista av content-blocks
+    - JSON-sträng som innehåller content-blocks
+    """
+
+    content = getattr(response_or_content, "content", response_or_content)
+
+    def _from_obj(obj: Any) -> list[str]:
+        parts = []
+
+        if obj is None:
+            return parts
+
+        if isinstance(obj, str):
+            s = obj.strip()
+            if not s:
+                return parts
+
+            # Försök tolka JSON-sträng som content-blocks
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    parsed = json.loads(s)
+                    return _from_obj(parsed)
+                except Exception:
+                    return [s]
+
+            return [s]
+
+        if isinstance(obj, list):
+            for item in obj:
+                parts.extend(_from_obj(item))
+            return parts
+
+        if isinstance(obj, dict):
+            block_type = obj.get("type")
+
+            # Det här är den vanliga sluttexten vi vill åt
+            if block_type == "text":
+                text_value = obj.get("text", "")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+                else:
+                    parts.extend(_from_obj(text_value))
+                return parts
+
+            # Resonemang ska inte med i slutanvändarsvaret
+            if block_type in {"reasoning", "summary", "tool_use", "input_json"}:
+                return parts
+
+            # Vissa format kan ha nested content
+            if "content" in obj:
+                parts.extend(_from_obj(obj["content"]))
+                return parts
+
+            # Fallback: plocka textfält om de finns
+            for key in ("text", "output_text", "value"):
+                if key in obj and isinstance(obj[key], str) and obj[key].strip():
+                    parts.append(obj[key].strip())
+                    return parts
+
+            return parts
+
+        # Okända objekt
+        text_attr = getattr(obj, "text", None)
+        type_attr = getattr(obj, "type", None)
+
+        if type_attr == "text" and isinstance(text_attr, str) and text_attr.strip():
+            return [text_attr.strip()]
+
+        return parts
+
+    text_parts = _from_obj(content)
+    final_text = "\n".join(p for p in text_parts if p).strip()
+
+    return final_text
+
+def group_evidence_by_page(evidence_items: List[EvidenceItem]) -> List[Dict[str, Any]]:
+    grouped = defaultdict(lambda: {
+        "doc_id": None,
+        "page": None,
+        "evidence_ids": [],
+    })
+
+    for e in evidence_items:
+        if isinstance(e, dict):
+            e = EvidenceItem(**e)
+
+        key = (e.source.doc_id, e.source.page)
+        bucket = grouped[key]
+
+        bucket["doc_id"] = e.source.doc_id
+        bucket["page"] = e.source.page
+
+        if e.evidence_id and e.evidence_id not in bucket["evidence_ids"]:
+            bucket["evidence_ids"].append(e.evidence_id)
+
+    out = list(grouped.values())
+    out.sort(key=lambda x: (x["doc_id"] or "", x["page"] if x["page"] is not None else 10**9))
+    return out
+
+def dedupe_sources(sources: List[SourceRef]) -> List[SourceRef]:
+    out = []
+    seen = set()
+
+    for s in sources:
+        if isinstance(s, dict):
+            s = SourceRef(**s)
+
+        key = (s.doc_id, s.element_id, s.page)
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+
+    return out
+
+def group_sources_by_page(sources: List[SourceRef]) -> List[Dict[str, Any]]:
+    grouped = defaultdict(lambda: {
+        "doc_id": None,
+        "page": None,
+        "element_ids": [],
+        "element_types": [],
+    })
+
+    for s in sources:
+        if isinstance(s, dict):
+            s = SourceRef(**s)
+
+        key = (s.doc_id, s.page)
+        bucket = grouped[key]
+
+        bucket["doc_id"] = s.doc_id
+        bucket["page"] = s.page
+
+        if s.element_id and s.element_id not in bucket["element_ids"]:
+            bucket["element_ids"].append(s.element_id)
+
+        if s.element_type and s.element_type not in bucket["element_types"]:
+            bucket["element_types"].append(s.element_type)
+
+    out = list(grouped.values())
+    out.sort(key=lambda x: (x["doc_id"] or "", x["page"] if x["page"] is not None else 10**9))
+    return out
+
+def extract_evidence_ids(text: str) -> List[str]:
+    ids = re.findall(r"E\d+", text or "")
+    return sorted(set(ids), key=lambda x: int(x[1:]))
+
+
+def mark_used_evidence(evidence_items: List[EvidenceItem], used_ids: List[str]) -> List[EvidenceItem]:
+    out = []
+    used_set = set(used_ids)
+
+    for e in evidence_items:
+        if isinstance(e, dict):
+            e = EvidenceItem(**e)
+
+        out.append(
+            e.model_copy(update={"used_in_answer": e.evidence_id in used_set})
+        )
+
+    return out
+
+def next_evidence_id(existing_items: List[EvidenceItem], new_count: int) -> str:
+    return f"E{len(existing_items) + new_count + 1}"
+
+def shorten_text(text: Any, max_len: int = 700) -> str:
+    s = "" if text is None else str(text).strip()
+    if len(s) <= max_len:
+        return s
+    return s[:max_len].rstrip() + "..."
+
+def format_clause_evidence(item: Dict[str, Any]) -> tuple[str, Optional[str], Dict[str, Any]]:
+    content = shorten_text(item.get("content", ""))
+    citation = f"page {item.get('page')}" if item.get("page") is not None else None
+
+    return (
+        content,
+        citation,
+        {
+            "element_type": item.get("element_type"),
+        },
+    )
+
+def format_sheet_evidence(item: Dict[str, Any]) -> tuple[str, Optional[str], Dict[str, Any]]:
+    row_label = item.get("row_label")
+    column_label = item.get("column_label")
+    fallback_label = item.get("label")
+    value = item.get("Value")
+    row_nr = item.get("Row")
+    col_letter = item.get("Column_letter")
+    col_nr = item.get("Column")
+
+    cell_ref = None
+    if col_letter and row_nr:
+        cell_ref = f"{col_letter}{row_nr}"
+
+    if row_label and column_label:
+        content = f"Extracted value '{value}' for row '{row_label}' and column '{column_label}'."
+    elif fallback_label:
+        content = f"Extracted value '{value}' for label '{fallback_label}'."
+    else:
+        content = f"Extracted value '{value}'."
+
+    citation_parts = []
+    if cell_ref:
+        citation_parts.append(f"cell {cell_ref}")
+    if row_nr:
+        citation_parts.append(f"row {row_nr}")
+    if col_nr:
+        citation_parts.append(f"column {col_nr}")
+
+    citation = ", ".join(citation_parts) if citation_parts else None
+
+    return (
+        content,
+        citation,
+        {
+            "row_label": row_label,
+            "column_label": column_label,
+            "label": fallback_label,
+            "value": value,
+            "value_num": item.get("Value_num"),
+            "row": row_nr,
+            "column": col_nr,
+            "column_letter": col_letter,
+        },
+    )
+
+def compact_observation_for_review(observation: dict) -> str:
+    tool_name = str(observation.get("tool", "") or "")
+    status = str(observation.get("status", "") or "")
+    message = str(observation.get("message", "") or "")
+    tool_args = observation.get("tool_args", {}) or {}
+    result_count = observation.get("result_count", 0)
+    source_refs = observation.get("source_refs", []) or []
+
+    return (
+        f"VERKTYG: {tool_name}\n"
+        f"STATUS: {status}\n"
+        f"MESSAGE: {message}\n"
+        f"RESULT_COUNT: {result_count}\n"
+        f"TOOL_ARGS: {json.dumps(tool_args, ensure_ascii=False, default=str)}\n"
+        f"SOURCE_REFS: {source_refs[:12]}"
+    )
+
+def keep_only_used_evidence(evidence_items: List[EvidenceItem]) -> List[EvidenceItem]:
+    return [
+        EvidenceItem(**e) if isinstance(e, dict) else e
+        for e in evidence_items
+        if (e.get("used_in_answer") if isinstance(e, dict) else e.used_in_answer)
+    ]
+
+# Find neighbours tool
+# Helper
+def _bbox_val(bbox, idx, default=float("inf")):
+    if bbox is None:
+        return default
+    try:
+        value = bbox[idx]
+        return float(value) if value is not None else default
+    except (IndexError, TypeError, ValueError):
+        return default
+
+# Helper sorters
+def pdf_sort(items):
+    """
+    items = list of row dictionaries for ONE pdf document.
+    Returns a list of element_id values sorted by:
+    page -> y1 -> x2 -> element_id
+    """
+    return [
+        item["element_id"]
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item["page"],
+                _bbox_val(item["bbox_xyxy"], 1),   # y1
+                _bbox_val(item["bbox_xyxy"], 0),   # x2
+                item["element_id"],                # deterministic tie-breaker
+            ),
+        )
+    ]
+
+
+def xlsx_sort(items):
+    """
+    items = list of row dictionaries for ONE spreadsheet document.
+    Returns a list of element_id values sorted by:
+    page -> element_id
+    """
+    return [
+        item["element_id"]
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item["page"],         # page used as sheet order
+                item["element_id"],   # deterministic tie-breaker
+            ),
+        )
+    ]
+
+
+# Sort delta table for "neighbor list"
+import json
+
+NEIGHBOUR_LIST_PATH = os.getenv("NEIGHBOUR_LIST_PATH", "")
+
+element_neighbour_list = []
+
+if NEIGHBOUR_LIST_PATH:
+    try:
+        with open(NEIGHBOUR_LIST_PATH, "r", encoding="utf-8") as f:
+            element_neighbour_list = json.load(f)
+    except Exception as e:
+        print(f"Could not load neighbour list: {repr(e)}")
+        element_neighbour_list = []
+
+# ------------------------------------------------------------------
+# Minimal deterministic sheet_lookup based on precomputed anatomy JSON
+# ------------------------------------------------------------------
+
+SHEET_LOOKUP_SUPPORTED_SCHEMAS = {
+    "sheet_table_regions_v1",
+    "sheet_table_regions_v1_compact",
+}
+
+SHEET_MONTH_WORDS = {
+    "januari", "februari", "mars", "april", "maj", "juni",
+    "juli", "augusti", "september", "oktober", "november", "december",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "okt", "nov", "dec"
+}
+
+
+def _sheet_col_letter(col_nr: int) -> str:
+    col_nr = int(col_nr)
+    out = []
+    while col_nr > 0:
+        col_nr, rem = divmod(col_nr - 1, 26)
+        out.append(chr(ord("A") + rem))
+    return "".join(reversed(out)) or "A"
+
+
+def _sheet_norm(value: Any) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[%€$£]", " ", s)
+    s = re.sub(r"[\(\)\[\]\{\}:;,_/\\|]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _sheet_is_empty(value: Any) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+def _sheet_parse_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+
+    s = s.replace("\u00a0", " ").replace(" ", "")
+    s = s.replace("%", "")
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or s in {"-", ".", ",", "-.", "-,"}:
+        return None
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if s.count(",") == 1 and len(s.split(",")[-1]) in {1, 2, 3}:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s and s.count(".") > 1:
+        s = s.replace(".", "")
+
+    try:
+        num = float(s)
+        return -num if negative else num
+    except Exception:
+        return None
+
+
+def _sheet_is_time_like_label(norm_label: str) -> bool:
+    if not norm_label:
+        return False
+
+    if norm_label in SHEET_MONTH_WORDS:
+        return True
+
+    if re.fullmatch(r"(19|20)\d{2}", norm_label):
+        return True
+
+    if re.fullmatch(r"(19|20)\d{2}\s*-\s*(0?[1-9]|1[0-2])", norm_label):
+        return True
+
+    if re.fullmatch(r"(q[1-4]|kv[1-4])", norm_label):
+        return True
+
+    return False
+
+
+def _sheet_load_payload(raw_table: Any) -> Dict[str, Any]:
+    payload = raw_table
+
+    if isinstance(payload, str):
+        payload = payload.strip()
+        if not payload:
+            raise ValueError("raw_table is empty")
+        payload = json.loads(payload)
+
+    if not isinstance(payload, dict):
+        raise ValueError("raw_table is not a JSON object")
+
+    schema_version = payload.get("schema_version")
+    if schema_version not in SHEET_LOOKUP_SUPPORTED_SCHEMAS:
+        raise ValueError(
+            f"sheet_lookup requires anatomy JSON with schema_version in "
+            f"{sorted(SHEET_LOOKUP_SUPPORTED_SCHEMAS)}, got: {schema_version}"
+        )
+
+    return payload
+
+
+def _sheet_region_by_id(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out = {}
+    for region in payload.get("table_regions", []) or []:
+        region_id = region.get("region_id")
+        if region_id:
+            out[str(region_id)] = region
+    return out
+
+
+def _sheet_rows_by_nr(region: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    out = {}
+    for row in region.get("rows", []) or []:
+        row_nr = row.get("row_nr")
+        if row_nr is not None:
+            out[int(row_nr)] = row
+    return out
+
+
+def _sheet_cols_by_nr(region: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    out = {}
+    for col in region.get("columns", []) or []:
+        col_nr = col.get("column_nr")
+        if col_nr is not None:
+            out[int(col_nr)] = col
+    return out
+
+
+def _sheet_cells_by_rc(region: Dict[str, Any]) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    out = {}
+    for cell in region.get("cells", []) or []:
+        row_nr = cell.get("row")
+        col_nr = cell.get("column")
+        if row_nr is None or col_nr is None:
+            continue
+        out[(int(row_nr), int(col_nr))] = cell
+    return out
+
+
+def _sheet_primary_row_label(region: Dict[str, Any], row_nr: int) -> Optional[str]:
+    row_meta = _sheet_rows_by_nr(region).get(int(row_nr), {}) or {}
+    candidates = row_meta.get("label_candidates") or []
+    for cand in candidates:
+        text = str(cand).strip()
+        if text:
+            return text
+
+    norm_candidates = row_meta.get("normalized_label_candidates") or []
+    for cand in norm_candidates:
+        text = str(cand).strip()
+        if text:
+            return text
+
+    return None
+
+
+def _sheet_column_label(region: Dict[str, Any], col_nr: int) -> Optional[str]:
+    col_meta = _sheet_cols_by_nr(region).get(int(col_nr), {}) or {}
+    label = col_meta.get("label")
+    if label is not None and str(label).strip():
+        return str(label).strip()
+
+    norm_label = col_meta.get("normalized_label")
+    if norm_label is not None and str(norm_label).strip():
+        return str(norm_label).strip()
+
+    return None
+
+
+def _sheet_dedupe_hits(hits: List[Dict[str, Any]], axis: str) -> List[Dict[str, Any]]:
+    out = []
+    seen = set()
+
+    for hit in hits or []:
+        if not isinstance(hit, dict):
+            continue
+
+        if axis == "row":
+            key = (
+                hit.get("region_id"),
+                hit.get("row_nr"),
+                hit.get("target_label"),
+            )
+        else:
+            key = (
+                hit.get("region_id"),
+                hit.get("column_nr"),
+                hit.get("target_label"),
+            )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(hit)
+
+    return out
+
+
+def _sheet_choose_axis(
+    norm_label: str,
+    row_hits: List[Dict[str, Any]],
+    col_hits: List[Dict[str, Any]],
+    region_by_id: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    if row_hits and not col_hits:
+        return "row"
+    if col_hits and not row_hits:
+        return "column"
+    if not row_hits and not col_hits:
+        return None
+
+    row_data_hits = False
+    row_header_hits = False
+    for hit in row_hits:
+        region = region_by_id.get(str(hit.get("region_id")))
+        if not region:
+            continue
+        row_meta = _sheet_rows_by_nr(region).get(int(hit.get("row_nr")), {}) or {}
+        kind = str(row_meta.get("kind") or "")
+        if kind == "data_row":
+            row_data_hits = True
+        if kind == "header_row":
+            row_header_hits = True
+
+    col_data_hits = False
+    col_header_hits = False
+    for hit in col_hits:
+        region = region_by_id.get(str(hit.get("region_id")))
+        if not region:
+            continue
+        col_meta = _sheet_cols_by_nr(region).get(int(hit.get("column_nr")), {}) or {}
+        kind = str(col_meta.get("kind") or "")
+        if kind == "data_column":
+            col_data_hits = True
+        if kind == "header_column":
+            col_header_hits = True
+
+    if _sheet_is_time_like_label(norm_label):
+        return "column"
+
+    if row_data_hits and not col_data_hits:
+        return "row"
+
+    if col_data_hits and not row_data_hits:
+        return "column"
+
+    if row_header_hits and col_data_hits:
+        return "column"
+
+    if col_header_hits and row_data_hits:
+        return "row"
+
+    if len(norm_label.split()) >= 2:
+        return "row"
+
+    return "column"
+
+
+def _sheet_resolve_hits(
+    target_labels: List[str],
+    payload: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    lookup_index = payload.get("lookup_index", {}) or {}
+    row_lookup = lookup_index.get("row_label_map", {}) or {}
+    col_lookup = lookup_index.get("column_label_map", {}) or {}
+    region_by_id = _sheet_region_by_id(payload)
+
+    resolved_rows = []
+    resolved_cols = []
+    unmatched = []
+
+    seen_norm_labels = set()
+
+    for target_label in target_labels or []:
+        norm_label = _sheet_norm(target_label)
+        if not norm_label or norm_label in seen_norm_labels:
+            continue
+        seen_norm_labels.add(norm_label)
+
+        raw_row_hits = row_lookup.get(norm_label, []) or []
+        raw_col_hits = col_lookup.get(norm_label, []) or []
+
+        row_hits = []
+        for hit in raw_row_hits:
+            if not isinstance(hit, dict):
+                continue
+            region_id = str(hit.get("region_id") or "")
+            row_nr = hit.get("row_nr")
+            if not region_id or row_nr is None or region_id not in region_by_id:
+                continue
+            row_hits.append({
+                "region_id": region_id,
+                "row_nr": int(row_nr),
+                "label": hit.get("label"),
+                "target_label": target_label,
+                "normalized_target_label": norm_label,
+            })
+
+        col_hits = []
+        for hit in raw_col_hits:
+            if not isinstance(hit, dict):
+                continue
+            region_id = str(hit.get("region_id") or "")
+            col_nr = hit.get("column_nr")
+            if not region_id or col_nr is None or region_id not in region_by_id:
+                continue
+            col_hits.append({
+                "region_id": region_id,
+                "column_nr": int(col_nr),
+                "column_letter": hit.get("column_letter"),
+                "label": hit.get("label"),
+                "target_label": target_label,
+                "normalized_target_label": norm_label,
+            })
+
+        axis = _sheet_choose_axis(
+            norm_label=norm_label,
+            row_hits=row_hits,
+            col_hits=col_hits,
+            region_by_id=region_by_id,
+        )
+
+        if axis == "row":
+            resolved_rows.extend(_sheet_dedupe_hits(row_hits, axis="row"))
+        elif axis == "column":
+            resolved_cols.extend(_sheet_dedupe_hits(col_hits, axis="column"))
+        else:
+            unmatched.append(target_label)
+
+    resolved_rows = sorted(
+        resolved_rows,
+        key=lambda x: (x["region_id"], x["row_nr"], _sheet_norm(x.get("target_label"))),
+    )
+    resolved_cols = sorted(
+        resolved_cols,
+        key=lambda x: (x["region_id"], x["column_nr"], _sheet_norm(x.get("target_label"))),
+    )
+
+    return resolved_rows, resolved_cols, unmatched
+
+
+def _sheet_make_item(
+    region: Dict[str, Any],
+    row_nr: int,
+    col_nr: int,
+    row_label: Optional[str],
+    column_label: Optional[str],
+    fallback_label: Optional[str],
+    match_type: str,
+    matched_labels: List[str],
+) -> Optional[Dict[str, Any]]:
+    cells_by_rc = _sheet_cells_by_rc(region)
+    cols_by_nr = _sheet_cols_by_nr(region)
+
+    cell = cells_by_rc.get((int(row_nr), int(col_nr)))
+    if not cell:
+        return None
+
+    value = cell.get("value")
+    if _sheet_is_empty(value):
+        return None
+
+    col_meta = cols_by_nr.get(int(col_nr), {}) or {}
+    column_letter = (
+        cell.get("column_letter")
+        or col_meta.get("column_letter")
+        or _sheet_col_letter(int(col_nr))
+    )
+
+    item = {
+        "row_label": row_label,
+        "column_label": column_label,
+        "label": fallback_label,
+        "Value": value,
+        "Value_num": cell.get("value_num", _sheet_parse_number(value)),
+        "Row": int(row_nr),
+        "Column": int(col_nr),
+        "Column_letter": column_letter,
+        "region_id": region.get("region_id"),
+        "match_type": match_type,
+        "matched_labels": matched_labels,
+    }
+
+    return item
+
+
+def _sheet_collect_intersections(
+    region: Dict[str, Any],
+    row_hits: List[Dict[str, Any]],
+    col_hits: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out = []
+
+    for row_hit in row_hits:
+        row_nr = int(row_hit["row_nr"])
+        row_label = row_hit.get("label") or _sheet_primary_row_label(region, row_nr)
+
+        for col_hit in col_hits:
+            col_nr = int(col_hit["column_nr"])
+            column_label = col_hit.get("label") or _sheet_column_label(region, col_nr)
+
+            item = _sheet_make_item(
+                region=region,
+                row_nr=row_nr,
+                col_nr=col_nr,
+                row_label=row_label,
+                column_label=column_label,
+                fallback_label=None,
+                match_type="intersection",
+                matched_labels=[row_hit.get("target_label"), col_hit.get("target_label")],
+            )
+            if item:
+                out.append(item)
+
+    return out
+
+
+def _sheet_collect_row_scan(
+    region: Dict[str, Any],
+    row_hits: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out = []
+    cols_by_nr = _sheet_cols_by_nr(region)
+
+    candidate_cols = sorted(
+        col_nr
+        for col_nr, meta in cols_by_nr.items()
+        if str(meta.get("kind") or "") != "header_column"
+    )
+
+    if not candidate_cols:
+        candidate_cols = sorted(cols_by_nr.keys())
+
+    for row_hit in row_hits:
+        row_nr = int(row_hit["row_nr"])
+        row_label = row_hit.get("label") or _sheet_primary_row_label(region, row_nr)
+
+        for col_nr in candidate_cols:
+            column_label = _sheet_column_label(region, col_nr)
+
+            item = _sheet_make_item(
+                region=region,
+                row_nr=row_nr,
+                col_nr=col_nr,
+                row_label=row_label,
+                column_label=column_label,
+                fallback_label=row_hit.get("target_label"),
+                match_type="row_scan",
+                matched_labels=[row_hit.get("target_label")],
+            )
+            if item:
+                out.append(item)
+
+    return out
+
+
+def _sheet_collect_column_scan(
+    region: Dict[str, Any],
+    col_hits: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out = []
+    rows_by_nr = _sheet_rows_by_nr(region)
+
+    data_row_start = region.get("data_row_start")
+    candidate_rows = []
+
+    for row_nr, meta in rows_by_nr.items():
+        kind = str(meta.get("kind") or "")
+        if kind == "data_row":
+            candidate_rows.append(int(row_nr))
+        elif data_row_start is not None and int(row_nr) >= int(data_row_start):
+            candidate_rows.append(int(row_nr))
+
+    candidate_rows = sorted(set(candidate_rows))
+    if not candidate_rows:
+        candidate_rows = sorted(rows_by_nr.keys())
+
+    for col_hit in col_hits:
+        col_nr = int(col_hit["column_nr"])
+        column_label = col_hit.get("label") or _sheet_column_label(region, col_nr)
+
+        for row_nr in candidate_rows:
+            row_label = _sheet_primary_row_label(region, row_nr)
+
+            item = _sheet_make_item(
+                region=region,
+                row_nr=row_nr,
+                col_nr=col_nr,
+                row_label=row_label,
+                column_label=column_label,
+                fallback_label=col_hit.get("target_label"),
+                match_type="column_scan",
+                matched_labels=[col_hit.get("target_label")],
+            )
+            if item:
+                out.append(item)
+
+    return out
+
+
+def _sheet_dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    seen = set()
+
+    for item in items or []:
+        key = (
+            item.get("region_id"),
+            item.get("Row"),
+            item.get("Column"),
+            item.get("Value"),
+            item.get("row_label"),
+            item.get("column_label"),
+            item.get("match_type"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+
+    out.sort(
+        key=lambda x: (
+            x.get("Row") if x.get("Row") is not None else 10**9,
+            x.get("Column") if x.get("Column") is not None else 10**9,
+            str(x.get("row_label") or ""),
+            str(x.get("column_label") or ""),
+        )
+    )
+    return out
+
+# Single node
+
+def safe_invoke_tool(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+
+    try:
+        tool = tools_by_name[tool_name]
+        observation = tool.invoke(tool_args)
+
+        if not isinstance(observation, dict):
+            return {
+                "tool": tool_name,
+                "status": "ERROR",
+                "message": f"Tool returned non-dict output: {type(observation).__name__}",
+                "data": [],
+                "sources": [],
+            }
+
+        return observation
+
+    except Exception as e:
+        return {
+            "tool": tool_name,
+            "status": "ERROR",
+            "message": f"Tool execution failed: {repr(e)}",
+            "data": [],
+            "sources": [],
+        }
+
+def count_tool_calls(result: dict) -> int:
+    return sum(
+        1
+        for m in result.get("messages", [])
+        if isinstance(m, ToolMessage)
+    )
+
+# 3) Tools
+
+
+@tool
+def similarity_search(query_text: str):
+    """Sök i datarummet efter de element som är mest relevanta för användarens fråga. Detta är normalt första verktyget att använda. Returnerar relevanta element med metadata, inklusive: doc_id, element_id, page, summary_text och element_type."""
+    number_of_results = 8
+
+    vsc = VectorSearchClient(disable_notice=True,
+        credential_strategy= CredentialStrategy.MODEL_SERVING_USER_CREDENTIALS
+    )
+    index = vsc.get_index(
+        endpoint_name="due_diligence",
+        index_name=VectorSearchIndex
+    )
+    
+    raw_results = index.similarity_search(
+        query_text=query_text,
+        columns=[
+            "doc_id",
+            "element_id",
+            "page",
+            "summary_text",
+            "element_type"
+        ],
+        num_results=number_of_results,
+        query_type= "hybrid",
+        reranker=DatabricksReranker(
+            columns_to_rerank=["summary_text"]
+        )
+    )
+    # turn raw_results into a dictionary results
+    cols = [c["name"] for c in raw_results.get("manifest", {}).get("columns", [])]
+    rows = raw_results.get("result", {}).get("data_array", [])
+    results = [dict(zip(cols, row)) for row in rows]
+
+    # setup response
+    nr_results = len(results)
+    status = "Ok" if nr_results > 0 else "Inga resultat hittades"
+    message = f"{nr_results} liknande chunks hittades i datarummet"
+
+    sources = [
+        SourceRef(
+            doc_id=r.get("doc_id"),
+            element_id=r.get("element_id"),
+            page=r.get("page"),
+            element_type=r.get("element_type"),
+        )
+        for r in results
+    ]
+
+    return ToolResponse(
+        tool="similarity_search",
+        status=status,
+        message=message,
+        data= results,
+        sources= sources,
+    ).model_dump()
+
+
+@tool
+def find_neighbours(element_id: str, eps: int):
+    """Hämta närliggande element_id runt ett känt element_id."""
+
+    for doc in element_neighbour_list:
+        elements = doc["elements"]
+        if element_id in elements:
+            idx = elements.index(element_id)
+            start = max(0, idx - eps)
+            end = min(len(elements), idx + eps + 1)
+            neighbour_ids = elements[start:end]
+
+            sources = [
+                SourceRef(
+                    doc_id=doc["doc_id"],
+                    element_id=eid,
+                    page=None,
+                    element_type=None,
+                )
+                for eid in neighbour_ids
+            ]
+
+            data = [
+                {"element_id": eid}
+                for eid in neighbour_ids
+            ]
+
+            return ToolResponse(
+                tool="find_neighbours",
+                status="Ok",
+                message=f"{len(neighbour_ids)} grannar hittades",
+                data=data,
+                sources=sources,
+            ).model_dump()
+
+    return ToolResponse(
+        tool="find_neighbours",
+        status="No",
+        message=f"element_id '{element_id}' hittades inte",
+        data=[],
+        sources=[],
+    ).model_dump()
+
+
+# Retrivers
+@tool
+def clause_lookup(element_id: Union[str, List[str]]):
+    """Hämta innehåll från en .pdf fil för ett eller flera element_id när elementtypen är text eller table."""
+    if isinstance(element_id, str):
+        element_id = [element_id]
+
+    element_id = [str(x).strip() for x in (element_id or []) if str(x).strip()]
+
+    if not element_id:
+        return ToolResponse(
+            tool="clause_lookup",
+            status="No",
+            message="No element_id was detected",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    query = f"""
+        SELECT
+            doc_id,
+            element_id,
+            page,
+            element_type,
+            raw_text,
+            raw_table
+        FROM {DBSQL_TABLE}
+        WHERE element_id IN ({_placeholders(element_id)})
+    """
+
+    rows = dbsql_fetch_all(query, element_id)
+
+    order_map = {eid: i for i, eid in enumerate(element_id)}
+    rows = sorted(rows, key=lambda r: order_map.get(r["element_id"], 10**9))
+
+    data = []
+    sources = []
+
+    for row in rows:
+        file_type = infer_file_type(row["doc_id"])
+        if file_type != "pdf":
+            continue
+
+        content = row.get("raw_text") or row.get("raw_table") or ""
+
+        if row.get("element_type") == "Text":
+            content = row.get("raw_text") or ""
+        elif row.get("element_type") == "Table":
+            content = row.get("raw_table") or ""
+
+        data.append({
+            "doc_id": row["doc_id"],
+            "element_id": row["element_id"],
+            "page": row["page"],
+            "element_type": row["element_type"],
+            "content": content,
+        })
+
+        sources.append(
+            SourceRef(
+                doc_id=row["doc_id"],
+                element_id=row["element_id"],
+                page=row["page"],
+                element_type=row["element_type"],
+            )
+        )
+
+    return ToolResponse(
+        tool="clause_lookup",
+        status="Ok" if data else "Inga resultat hittades",
+        message=f"{len(data)} pdf-chunks hittade",
+        data=data,
+        sources=sources,
+    ).model_dump()
+
+@tool
+def sheet_labels(element_id: str):
+    """Hämta enkla rad- och kolumnlabels från ett sheet element baserat på header_row_indices och header_column_indices."""
+
+    def _dedupe_preserve_order(values: List[Any]) -> List[str]:
+        out = []
+        seen = set()
+        for v in values or []:
+            s = str(v).strip()
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    if not element_id or not str(element_id).strip():
+        return ToolResponse(
+            tool="sheet_labels",
+            status="ERROR",
+            message="sheet_labels requires element_id",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    element_id = str(element_id).strip()
+
+    rows = dbsql_fetch_all(
+        f"""
+        SELECT
+            doc_id,
+            page,
+            element_type,
+            element_title,
+            raw_table
+        FROM {DBSQL_TABLE}
+        WHERE element_id = ?
+        """,
+        [element_id],
+    )
+
+    if not rows:
+        return ToolResponse(
+            tool="sheet_labels",
+            status="No",
+            message="No matching sheet found",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    row = rows[0]
+    doc_id = row["doc_id"]
+    page = row["page"]
+    element_type = str(row["element_type"] or "").strip()
+    file_type = infer_file_type(doc_id)
+
+    source_ref = SourceRef(
+        doc_id=doc_id,
+        element_id=element_id,
+        page=page,
+        element_type=element_type,
+    )
+
+    if file_type not in {"xlsx", "xls"}:
+        return ToolResponse(
+            tool="sheet_labels",
+            status="ERROR",
+            message=f"sheet_labels requires .xlsx/.xls but got {file_type}",
+            data=[],
+            sources=[source_ref],
+        ).model_dump()
+
+    if element_type.lower() != "sheet":
+        return ToolResponse(
+            tool="sheet_labels",
+            status="ERROR",
+            message=f"sheet_labels requires element_type='Sheet' but got '{element_type}'",
+            data=[],
+            sources=[source_ref],
+        ).model_dump()
+
+    try:
+        payload = _sheet_load_payload(row["raw_table"])
+    except Exception as e:
+        return ToolResponse(
+            tool="sheet_labels",
+            status="ERROR",
+            message=f"Invalid anatomy JSON in raw_table: {repr(e)}",
+            data=[],
+            sources=[source_ref],
+        ).model_dump()
+
+    region_by_id = _sheet_region_by_id(payload)
+
+    if not region_by_id:
+        return ToolResponse(
+            tool="sheet_labels",
+            status="No",
+            message="No table_regions found in sheet anatomy JSON",
+            data=[],
+            sources=[source_ref],
+        ).model_dump()
+
+    row_labels = []
+    column_labels = []
+
+    for region_id, region in sorted(region_by_id.items(), key=lambda x: str(x[0])):
+        header_rows = {int(x) for x in (region.get("header_row_indices") or []) if x is not None}
+        header_cols = {int(x) for x in (region.get("header_column_indices") or []) if x is not None}
+        cells = region.get("cells", []) or []
+
+        header_row_cells = sorted(
+            [
+                c for c in cells
+                if c.get("row") is not None
+                and int(c.get("row")) in header_rows
+                and c.get("value") is not None
+                and str(c.get("value")).strip() != ""
+            ],
+            key=lambda c: (int(c.get("row")), int(c.get("column") or 10**9))
+        )
+
+        header_col_cells = sorted(
+            [
+                c for c in cells
+                if c.get("column") is not None
+                and int(c.get("column")) in header_cols
+                and c.get("value") is not None
+                and str(c.get("value")).strip() != ""
+            ],
+            key=lambda c: (int(c.get("column")), int(c.get("row") or 10**9))
+        )
+
+        column_labels.extend(str(c.get("value")).strip() for c in header_row_cells)
+        row_labels.extend(str(c.get("value")).strip() for c in header_col_cells)
+
+    row_labels = _dedupe_preserve_order(row_labels)
+    column_labels = _dedupe_preserve_order(column_labels)
+
+    target_labels_text = (
+        f"Rad Labels: {row_labels}\n"
+        f"Kolumn Labels: {column_labels}"
+    )
+
+    data_item = {
+        "sheet_name": (payload.get("sheet") or {}).get("sheet_name") or row.get("element_title"),
+        "sheet_nr": (payload.get("sheet") or {}).get("sheet_nr", page),
+        "row_labels": row_labels,
+        "column_labels": column_labels,
+        "target_labels": target_labels_text,
+    }
+
+    return ToolResponse(
+        tool="sheet_labels",
+        status="Ok",
+        message=(
+            f"rad-labels: {len(row_labels)}"
+            f"kolumn-labels: {len(column_labels)}"
+        ),
+        data=[data_item],
+        sources=[source_ref],
+    ).model_dump()
+
+@tool
+def sheet_lookup(element_id: str, target_labels: List[str]):
+    """Hämta specifika värden ur en .xlsx fil för chunks med element_type=Sheet genom att matcha target_labels mot rader och kolumner."""
+
+    if isinstance(target_labels, str):
+        target_labels = [target_labels]
+
+    target_labels = [
+        str(x).strip()
+        for x in (target_labels or [])
+        if str(x).strip()
+    ]
+
+    if not element_id:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="ERROR",
+            message="sheet_lookup requires element_id",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    element_id = str(element_id).strip()
+
+    if not target_labels:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="ERROR",
+            message="sheet_lookup requires target_labels",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    rows = dbsql_fetch_all(
+        f"""
+        SELECT
+            doc_id,
+            page,
+            element_type,
+            raw_table
+        FROM {DBSQL_TABLE}
+        WHERE element_id = ?
+        """,
+        [element_id],
+    )
+
+    if not rows:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="No",
+            message="No matching sheet found",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    row = rows[0]
+    file_type = infer_file_type(row["doc_id"])
+    element_type = str(row["element_type"] or "").strip().lower()
+
+    if file_type not in {"xlsx", "xls"}:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="ERROR",
+            message=f"sheet_lookup requires .xlsx/.xls but got {file_type}",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    if element_type != "sheet":
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="ERROR",
+            message=f"sheet_lookup requires element_type='Sheet' but got '{row['element_type']}'",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    try:
+        payload = _sheet_load_payload(row["raw_table"])
+    except Exception as e:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="ERROR",
+            message=f"Invalid anatomy JSON in raw_table: {repr(e)}",
+            data=[],
+            sources=[],
+        ).model_dump()
+
+    region_by_id = _sheet_region_by_id(payload)
+
+    if not region_by_id:
+        return ToolResponse(
+            tool="sheet_lookup",
+            status="No",
+            message="No table_regions found in sheet anatomy JSON",
+            data=[],
+            sources=[
+                SourceRef(
+                    doc_id=row["doc_id"],
+                    element_id=element_id,
+                    page=row["page"],
+                    element_type=row["element_type"],
+                )
+            ],
+        ).model_dump()
+
+    resolved_rows, resolved_cols, unmatched = _sheet_resolve_hits(
+        target_labels=target_labels,
+        payload=payload,
+    )
+
+    rows_by_region = defaultdict(list)
+    cols_by_region = defaultdict(list)
+
+    for hit in resolved_rows:
+        rows_by_region[hit["region_id"]].append(hit)
+
+    for hit in resolved_cols:
+        cols_by_region[hit["region_id"]].append(hit)
+
+    all_region_ids = sorted(set(rows_by_region.keys()) | set(cols_by_region.keys()))
+
+    data = []
+    for region_id in all_region_ids:
+        region = region_by_id.get(region_id)
+        if not region:
+            continue
+
+        row_hits = sorted(rows_by_region.get(region_id, []), key=lambda x: x["row_nr"])
+        col_hits = sorted(cols_by_region.get(region_id, []), key=lambda x: x["column_nr"])
+
+        if row_hits and col_hits:
+            data.extend(_sheet_collect_intersections(region, row_hits, col_hits))
+        elif row_hits:
+            data.extend(_sheet_collect_row_scan(region, row_hits))
+        elif col_hits:
+            data.extend(_sheet_collect_column_scan(region, col_hits))
+
+    data = _sheet_dedupe_items(data)
+
+    matched_labels = []
+    seen_label = set()
+    for hit in resolved_rows + resolved_cols:
+        label = str(hit.get("target_label") or "").strip()
+        if label and label not in seen_label:
+            seen_label.add(label)
+            matched_labels.append(label)
+
+    status = "Ok" if data else "No"
+
+    if data:
+        message = (
+            f"{len(data)} values extracted from sheet. "
+            f"Matched labels: {matched_labels or []}. "
+            f"Unmatched labels: {unmatched or []}."
+        )
+    else:
+        message = (
+            f"No values extracted. "
+            f"Matched labels: {matched_labels or []}. "
+            f"Unmatched labels: {unmatched or []}."
+        )
+
+    return ToolResponse(
+        tool="sheet_lookup",
+        status=status,
+        message=message,
+        data=data,
+        sources=[
+            SourceRef(
+                doc_id=row["doc_id"],
+                element_id=element_id,
+                page=row["page"],
+                element_type=row["element_type"],
+            )
+        ],
+    ).model_dump()
+
+@tool
+def calculate(expression: str) -> Dict[str, Any]:
+    """Genomför säkra aritmetiska beräkningar med siffror från bevisen."""
+
+    allowed = {
+        ast.Add: op.add,
+        ast.Sub: op.sub,
+        ast.Mult: op.mul,
+        ast.Div: op.truediv,
+        ast.Pow: op.pow,
+        ast.USub: op.neg,
+    }
+
+    def eval_node(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed:
+            return allowed[type(node.op)](eval_node(node.left), eval_node(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed:
+            return allowed[type(node.op)](eval_node(node.operand))
+        raise ValueError("Unsupported expression")
+
+    result = eval_node(ast.parse(expression, mode="eval").body)
+    return {"tool": "calculate", "status": "Ok", "message": str(result), "data": [{"result": result}], "sources": []}
+
+# 3) Query & Krav-lista
+
+# benchmark questions
+query_list = []
+
+q01 = "Hur stor andel av driftkostnaderna år 2019 utgjordes av posten ‘4161 Snöröjning mm’? Ange både belopp, total driftkostnad och andel i procent."						
+q02 = "Finns det några skulder som ägaren av denna fastigheten bär?"							
+q03 = "Vilken är den kortaste 'uppsägningstiden' av alla avtal?"							
+q04 = "Under vilket år var energiförbrukningen högst, och vad var värdet det året?"							
+q05 = "är denna fastighet en bra investering?"						
+q06 = "Ge en sammanställning av drift- och underhållskostnader för de senaste tre åren i tabellform, inklusive år, belopp per kategori, totalkostnad och förändring mot föregående år."							
+q07 = "Analysera resultatrapporten och lyft fram de tre viktigaste trenderna för en investerare. Motivera varje punkt med konkreta siffror från underlaget"						
+q08 = "Finns det något i 'hyresavtalet' under ‘Särskilda bestämmelser’ som avviker från eller står i konflikt med andra villkor i avtalet? Ange i så fall vilka två delar som krockar och varför"						
+q09 = "Vilka är största riskerna med det här fastighetsbeståndet?"						
+q010 = "Sammanfatta gränsdragningslistan och dela upp ansvarsområden i två kolumner: hyresvärdens ansvar respektive hyresgästens ansvar."						
+q11 = "När ska hyran betalas?"
+query_list.extend([q01,q02,q03,q04,q05,q06,q07,q08,q09,q010, q11])
+query = query_list[7]
+
+krav_lista = "\n".join(["Hur fördelas ansvar, kostnader och intäkter i samfälligheter eller gemensamhetsanläggningar (GA)?\n",
+"Är de redovisade driftkostnaderna rimliga att använda som grund för förvärvet?\n",
+"Finns det någon identifierad besparingspotential i driften?\n",
+"Finns det en risk för betydande ökningar av förbrukningskostnaderna framöver?\n",
+"Vilka underhållsåtgärder planeras framåt och vad är deras beräknade kostnad?\n",
+"Finns det förvaltnings- eller factoringavtal som inte går att säga upp i samband med överlåtelsen?\n",
+"Vilka specifika villkor gäller för dessa avtal?\n",
+"Vilka åtgärder kan vänta till efter tillträdet och vad kommer de att kosta?\n",
+"Finns det aktieägartillskott i bolaget och hur ska dessa hanteras vid transaktionen?\n",
+"Vilka redovisningsprinciper har bolaget tillämpat?\n",
+"Har bolaget andra tillgångar eller skulder som köparen måste ta ställning till?\n",
+"Vilka lån, krediter och övriga finansiella avtal finns i bolaget?\n",
+"Vilka bank- och plusgirokonton disponeras av bolaget?\n",
+"Finns det några restriktioner eller kostnader för att lösa befintliga lån?\n",
+"Finns det borgensåtaganden eller andra finansiella åtaganden som belastar bolaget?\n",
+"Har bolaget eller moderbolaget ställt garantier eller säkerheter för tredje part?\n",
+"Finns det revisionsrapporter eller korrespondens från revisorer med väsentliga noteringar?\n",
+"Finns det koncerninterna lån, management fees eller andra interna mellanhavanden?\n",
+"Är prissättning och villkor i dessa interna upplägg marknadsmässiga?\n",
+"Finns det en fullständig förteckning över personal- och lönerelaterade skulder?\n",
+"Hur stor är den aktuella semesterlöneskulden?\n",
+"Finns det pågående korrespondens eller tvister med Skatteverket eller skattedomstolar?\n",
+"Finns det pågående, genomförda eller förväntade skatterevisioner?\n",
+"Har samtliga skatter redovisats och betalats i rätt tid?\n",
+"Har det skett direkta eller indirekta ägarförändringar, fusioner, fissioner eller underprisöverlåtelser?\n",
+"Har tidigare omstruktureringar gett upphov till underskott eller andra skatteeffekter?\n",
+"Har kapitalvinster vid tidigare försäljningar beräknats och deklarerats korrekt?\n",
+"Finns det pågående jämkning av ingående moms som köparen behöver överta?\n",
+"Är omfattningen av den frivilliga skattskyldigheten för moms korrekt redovisad?\n",
+"Vilka specifika skattemässiga justeringar har gjorts i deklarationerna?\n",
+"Vilka principer används för bolagets skattemässiga avskrivningar?\n",
+"Finns det en risk för att avskrivningarna är för låga eller för höga?\n",
+"Bedöms fastighetstaxeringsvärdet vara för högt eller för lågt i förhållande till marknadsvärdet?\n",
+"Finns det skatter eller avgifter som inte betalats eller som diskuteras med myndigheter?\n",
+"Finns det transaktioner mellan bolaget och ägare eller närstående som behöver granskas?\n",
+"Har korrekta reserveringar gjorts i årsredovisningen för eventuella tvister eller krav?\n",
+"Är samtliga försäkringspremier betalda fram till tillträdesdagen?\n",
+"Har bolaget fullgjort alla sina pensionsåtaganden?\n",
+"Kan befintliga pensionsåtaganden medföra framtida kostnader för köparen?\n",
+"Finns det avtal om bonus, provision eller annan prestationsrelaterad ersättning?\n"])
+
+# 4) Multi August
+
+# 1) Tools
+tools = [similarity_search, sheet_labels, sheet_lookup, clause_lookup, find_neighbours]
+tools_by_name = {t.name: t for t in tools}
+
+# 3) Nodes
+
+# Query Planner
+def query_planner_node(state: MultiAugustState):
+
+    planer_llm = llm1
+
+    human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+
+    #Fallback if no query
+    if not human_messages:
+        empty_plan = QueryPlan(
+            original_query="",
+            rewritten_query="",
+            task_type="blandat",
+            search_terms=[],
+            answer_criteria=[],
+        )
+        return {
+            "user_query": "",
+            "query_plan": empty_plan.model_dump(),
+            "ready_to_finalize": False,
+        }
+
+    #Fallback if no plan
+    user_query = str(human_messages[-1].content).strip()
+
+    fallback_plan = QueryPlan(
+        original_query=user_query,
+        rewritten_query=user_query,
+        task_type="blandat",
+        search_terms=[user_query] if user_query else [],
+        answer_criteria=[
+            "Svaret ska bygga enbart på explicit evidens från datarummet.",
+            "Om uppgiften kräver siffror eller villkor måste dessa kunna hämtas från källorna.",
+            "Om underlag saknas ska detta sägas tydligt.",
+        ],
+    )
+
+    planner_prompt = """
+        Returnera endast ett QueryPlan-objekt.
+        Var konservativ.
+        Behåll användarens intention exakt.
+        Hitta inte på labels, dokument eller källor.
+        Använd tomma listor hellre än att gissa.
+        """
+
+
+    try:
+        planner_llm = planer_llm.with_structured_output(QueryPlan)
+        raw_plan = planner_llm.invoke(
+            [
+                SystemMessage(content=planner_prompt),
+                HumanMessage(content=user_query),
+            ]
+        )
+        # Write plan to state
+        if isinstance(raw_plan, QueryPlan):
+            plan = raw_plan.model_copy(
+                update={
+                    "original_query": user_query,
+                    "rewritten_query": (raw_plan.rewritten_query or user_query).strip(),
+                    "search_terms": _normalize_list(raw_plan.search_terms),
+                    "answer_criteria": _normalize_list(raw_plan.answer_criteria),
+                }
+            )
+            print(plan)
+        # If planner fails and plan is written as a dict
+        elif isinstance(raw_plan, dict):
+            plan = QueryPlan(
+                original_query=user_query,
+                rewritten_query=str(raw_plan.get("rewritten_query") or user_query).strip(),
+                task_type=raw_plan.get("task_type") or "blandat",
+                search_terms=_normalize_list(raw_plan.get("search_terms")),
+                answer_criteria=_normalize_list(raw_plan.get("answer_criteria")),
+            )
+            print(plan)
+        else:
+            plan = fallback_plan
+            #rint(plan)
+
+    except Exception as e:
+        print("Query planning failed:", repr(e))
+        plan = fallback_plan
+        print(plan)
+
+    return {
+        "user_query": user_query,
+        "query_plan": plan.model_dump(),
+        "ready_to_finalize": False,
+    }
+
+# Task Handler
+def task_handler_node(state: MultiAugustState):
+    anti_loop_number = 4
+    task_llm = llm2.bind_tools(tools)
+
+    qp = _coerce_query_plan(state)
+    # Fetch query plan
+    human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+    user_query = state.get("user_query", "") or (
+        str(human_messages[-1].content).strip() if human_messages else ""
+    )
+    # Fetch evidence
+    existing_evidence = _normalize_evidence_items(state.get("evidence_items", []))
+    latest_tool_results = _normalize_tool_result_records(
+        state.get("latest_tool_results", []) or []
+    )
+
+    new_evidence = _collect_new_evidence_from_tool_results(
+        tool_results=latest_tool_results,
+        existing_items=existing_evidence,
+    )
+    all_evidence = existing_evidence + new_evidence
+    
+    # Fetch recent observations
+    recent_observations = (state.get("tool_observations", []) or [])[-6:]
+    observation_context = "\n\n---\n\n".join(
+        compact_observation_for_review(obs) for obs in recent_observations
+    ).strip()
+
+    if not observation_context:
+        observation_context = "Inga verktygsobservationer ännu."
+
+    # Minimal anti-loop check based on actual newly introduced evidence
+    came_from_tool_node = bool(latest_tool_results)
+
+    previous_no_new_count = int(state.get("no_new_evidence_iterations", 0) or 0)
+
+    if new_evidence:
+        no_new_evidence_count = 0
+    elif came_from_tool_node:
+        no_new_evidence_count = previous_no_new_count + 1
+    else:
+        no_new_evidence_count = previous_no_new_count
+
+    if no_new_evidence_count >= anti_loop_number:
+        print(
+            f"[TASK_HANDLER] ANTI-LOOP TRIGGERED: "
+            f"{anti_loop_number} consecutive task/tool iterations introduced no new evidence"
+        )
+        return {
+            "messages": [],
+            "evidence_items": new_evidence,
+            "no_new_evidence_iterations": no_new_evidence_count,
+            "ready_to_finalize": True,
+        }
+    # Presenation av evidens
+    evidence_context = "\n\n".join(
+        f"[{e.evidence_id}]\n"
+        f"Källa: {e.source.doc_id} | element: {e.source.element_id} | sida: {e.source.page} | typ: {e.source.element_type}\n"
+        f"Verktyg: {e.tool}\n"
+        f"Context:\n{e.context}\n"
+        f"Structured data:\n{json.dumps(e.structured_data or {}, ensure_ascii=False, default=str)}"
+        for e in all_evidence
+    ).strip()
+
+    if not evidence_context:
+        evidence_context = "Ingen sparad evidens ännu."
+
+    latest_results_context = json.dumps(
+        [compact_tool_result_for_llm(r) for r in latest_tool_results[:4]],
+        ensure_ascii=False,
+        default=str,
+    )
+    navigation_context = compact_navigation_memory_for_llm(
+        state.get("navigation_memory", {}) or {}
+    )
+
+    task_handler_prompt = """
+        Du är Evidence Gatherer i en Financial Due Diligence-agent.
+
+        Uppgift: avgör om Finalizer kan svara på befintlig evidens eller om mer informationsinhämtning krävs . Skriv aldrig slutsvaret själv.
+
+        Prioritet:
+        1. Originalfrågan styr. Query plan och answer_criteria är endast stöd.
+        2. Optimera för tillräcklig evidens.
+        3. Saknad information får hanteras som begränsning.
+
+        Evidens:
+        - Endast clause_lookup och sheet_lookup skapar evidens.
+        - similarity_search, find_neighbours och sheet_labels är endast navigation.
+        - Finalisera om evidens direkt kan besvara originalfrågan, även med tydlig caveat.
+        - Fortsätt inte söka bara för att mer komplett DD-underlag vore önskvärt.
+
+        Sök vidare endast om:
+        - informationen är nödvändig för originalfrågan,
+        - det finns en konkret ny sökväg,
+        - sökvägen inte redan prövats,
+        - den rimligen kan ge evidens via clause_lookup eller sheet_lookup.
+
+        Stoppa och finalisera om:
+        - befintlig evidens räcker för svar,
+        - senaste verktyg inte gav ny evidens,
+        - samma informationsbehov redan sökts utan resultat,
+        - ytterligare sökning sannolikt upprepar tidigare försök.
+
+        Tool-policy:
+        - Använd similarity_search endast när kandidat-element saknas.
+        - Använd clause_lookup för relevanta PDF-element.
+        - Använd sheet_labels före sheet_lookup vid okänt Excel-/sheet-innehåll.
+        - Använd sheet_lookup endast med sheet-element och konkreta target_labels.
+        - Upprepa inte liknande search_terms, element_id eller target_labels.
+        - Gör högst ett nytt sökspår per iteration.
+
+        När du är klar:
+        Skriv INTE ett svar på frågan, skriv endast exakt: "Tillräcklig evidens finns. Finalizer kan sammanställa svaret."
+        Gör inget tool call.
+
+        Om mer information krävs:
+        Gör endast nästa mest värdefulla tool call.
+        """
+
+    planning_context = HumanMessage(
+        content=(
+            f"Original användarfråga, högsta prioritet: {user_query} \n\n"
+            f"Query plan, endast vägledande:\n"
+            f"- Förtydligad fråga: {qp.rewritten_query}\n"
+            f"- typ av uppgift: {qp.task_type}\n"
+            f"- hjälp söktermer: {qp.search_terms}\n"
+            f"- målbild för svar, ej absoluta krav: {qp.answer_criteria}\n\n"
+            "Viktigt: Om query plan breddar frågan mer än användaren bad om, följ originalfrågan."
+        )
+    )
+    evidence_message = HumanMessage(
+        content=(
+            "Nuvarande sparad evidens:\n"
+            f"{evidence_context}"
+        )
+    )
+
+    latest_results_message = HumanMessage(
+        content=(
+            "Senaste fulla verktygs-resultat:\n"
+            f"{latest_results_context}"
+        )
+    )
+
+    observations_message = HumanMessage(
+        content=(
+            "Senaste verktygsobservationer:\n"
+            f"{observation_context}"
+        )
+    )
+
+    navigation_message = HumanMessage(
+        content=(
+            "Navigationsminne från tidigare verktygsanrop.\n"
+            f"{navigation_context}"
+        )
+    )
+
+    response = task_llm.invoke(
+        [
+            SystemMessage(content=task_handler_prompt),
+            planning_context,
+            navigation_message,
+            observations_message,
+            latest_results_message,
+            evidence_message,
+        ]
+    )
+
+    task_handler_text = extract_final_text(getattr(response, "content", ""))
+    print("\n[TASK_HANDLER TEXT]", flush=True)
+    print(task_handler_text if task_handler_text else "<no visible assistant text>", flush=True)
+
+    has_tool_calls = bool(getattr(response, "tool_calls", None))
+    has_real_evidence = any(e.tool in {"clause_lookup", "sheet_lookup"} for e in all_evidence)
+
+    ready_to_finalize = (not has_tool_calls)
+
+    if ready_to_finalize and not has_real_evidence:
+        ready_to_finalize = False
+
+    return {
+        "messages": [response],
+        "evidence_items": new_evidence,
+        "no_new_evidence_iterations": no_new_evidence_count,
+        "ready_to_finalize": ready_to_finalize,
+    }
+
+
+def tool_node(state: MultiAugustState):
+    results: List[ToolMessage] = []
+    compact_observations: List[Dict[str, Any]] = []
+    latest_tool_results: List[ToolResultRecord] = []
+
+    last_message = state["messages"][-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+
+    navigation_updates = empty_navigation_memory()
+
+    if not tool_calls:
+        return {
+            "messages": [],
+            "tool_observations": [],
+            "latest_tool_results": [],
+        }
+
+    for tool_call in tool_calls:
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("args", {}) or {}
+        tool_call_id = tool_call.get("id")
+
+        if tool_name not in tools_by_name:
+            error_raw = {
+                "tool": tool_name,
+                "status": "ERROR",
+                "message": f"Okänt tool: {tool_name}",
+                "data": [],
+                "sources": [],
+                "tool_args": tool_args,
+            }
+
+            compact = build_compact_tool_observation(error_raw, tool_name, tool_args)
+            normalized_result = normalize_raw_tool_result(error_raw, tool_name, tool_args)
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        resolved_tool_name, resolved_tool_args, validation_error = validate_or_route_tool_call(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            state=state,
+        )
+
+        recent_obs = state.get("tool_observations", [])[-8:]
+        recent_signatures = {
+            _tool_signature(obs.get("tool", ""), obs.get("tool_args", {}) or {})
+            for obs in recent_obs
+        }
+
+        current_sig = _tool_signature(resolved_tool_name, resolved_tool_args)
+
+        if current_sig in recent_signatures:
+            blocked_raw = {
+                "tool": resolved_tool_name,
+                "status": "BLOCKED",
+                "message": "Upprepat tool call blockerades för att undvika loop, pröva något annat.",
+                "data": [],
+                "sources": [],
+                "tool_args": resolved_tool_args,
+            }
+
+            compact = build_compact_tool_observation(blocked_raw, resolved_tool_name, resolved_tool_args)
+            normalized_result = normalize_raw_tool_result(blocked_raw, resolved_tool_name, resolved_tool_args)
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        if validation_error is not None:
+            validation_raw = {
+                "tool": validation_error.tool,
+                "status": validation_error.status,
+                "message": validation_error.message,
+                "data": [],
+                "tool_args": validation_error.tool_args,
+            }
+
+            compact = build_compact_tool_observation(
+                validation_raw,
+                validation_error.tool,
+                validation_error.tool_args,
+            )
+            normalized_result = normalize_raw_tool_result(
+                validation_raw,
+                validation_error.tool,
+                validation_error.tool_args,
+            )
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        tool = tools_by_name[resolved_tool_name]
+
+        try:
+            raw_observation = tool.invoke(resolved_tool_args)
+
+            if not isinstance(raw_observation, dict):
+                raw_observation = {
+                    "tool": resolved_tool_name,
+                    "status": "ERROR",
+                    "message": f"Tool returned non-dict output: {type(raw_observation).__name__}",
+                    "data": [],
+                    "sources": [],
+                }
+
+        except Exception as e:
+            raw_observation = {
+                "tool": resolved_tool_name,
+                "status": "ERROR",
+                "message": f"Tool execution failed: {repr(e)}",
+                "data": [],
+                "sources": [],
+            }
+
+        normalized_result = normalize_raw_tool_result(
+            raw_observation,
+            resolved_tool_name,
+            resolved_tool_args,
+        )
+        normalized_result_dict = normalized_result.model_dump()
+
+        navigation_updates = merge_navigation_memory(
+                navigation_updates,
+                build_navigation_memory_update(normalized_result),
+            )
+
+        compact = build_compact_tool_observation(
+            normalized_result_dict,
+            resolved_tool_name,
+            resolved_tool_args,
+        )
+
+        results.append(
+            ToolMessage(
+                content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                tool_call_id=tool_call_id,
+            )
+        )
+
+        compact_observations.append(compact.model_dump())
+        latest_tool_results.append(normalized_result)
+
+    return {
+        "messages": results,
+        "tool_observations": compact_observations,
+        "latest_tool_results": latest_tool_results,
+        "navigation_memory": navigation_updates,
+    }
+
+def finalizer_node(state: MultiAugustState):
+
+    answer_llm = llm3
+    review_llm = llm4
+
+    # Hämta bakgrund: QueryPlan och evidence items
+    qp = _coerce_query_plan(state)
+    user_query = state.get("user_query", "") or qp.original_query
+    evidence_items = _normalize_evidence_items(state.get("evidence_items", []))
+
+    evidence_context = "\n\n---\n\n".join(
+        (
+            f"[{e.evidence_id}]\n"
+            f"Källa: {e.source.doc_id} | element: {e.source.element_id} | "
+            f"sida: {e.source.page} | typ: {e.source.element_type}\n"
+            f"Verktyg: {e.tool}\n"
+            f"Context:\n{e.context}\n"
+            f"Structured data:\n{json.dumps(e.structured_data or {}, ensure_ascii=False, default=str)}"
+        )
+        for e in evidence_items
+    )[:22000]
+
+    if not evidence_context.strip():
+        evidence_context = "Ingen evidens har samlats in."
+
+    # 1) Formulera svar till användarens query baserat på evidence_items
+    answer_prompt = """
+            Du är Finalizer i en Financial Due Diligence-agent.
+
+            Uppgift: skriv ett slutligt svar på svenska, endast baserat på given evidens. Svara på originalfrågan, inte bredare än så.
+
+            Regler:
+            - Använd endast explicit evidens från EvidenceTrail.
+            - Varje sakpåstående ska ha evidensreferens: [E1] eller [E1, E2].
+            - Använd endast evidens-ID:n som finns i underlaget.
+            - Om evidens saknas eller är indirekt, säg det tydligt.
+            - Skilj på bevisad uppgift, indikation och saknad information.
+            - Hitta inte på belopp, villkor, dokument, parter eller slutsatser.
+            - Om query plan är bredare än originalfrågan, följ originalfrågan.
+            - Försök gör svaret så användbart som möjligt för en Financial Due Dilligence medarbetare
+            - Använd gärna pedagogiska presentationsmedell som figurer, tabeller eller symboler om det gör svaret tydligare 
+
+            Svarslogik:
+            1. Ge först ett direkt svar på frågan.
+            2. Sammanfatta relevant evidens.
+            3. Ange viktiga begränsningar eller saknade uppgifter.
+            4. Om siffror används, visa kort hur de hänger ihop.
+            5. Om underlaget inte räcker, säg vad som kan och inte kan fastställas.
+
+            Ton:
+            Professionell, tydlig och koncis. Redogör kortfattat för ditt hur du resonerat när du har dragit slutsatser. Ingen markdown-tabell om det inte hjälper.
+            """
+
+    answer_response = answer_llm.invoke(
+        [
+            SystemMessage(content=answer_prompt),
+            HumanMessage(
+                content=f"""
+    Originalfråga:
+    {user_query}
+
+    Query plan, endast vägledande:
+    - rewritten_query: {qp.rewritten_query}
+    - task_type: {qp.task_type}
+    - answer_criteria: {qp.answer_criteria}
+
+    Evidens:
+    {evidence_context}
+    """
+            ),
+        ]
+    )
+
+    draft_answer = extract_final_text(answer_response.content)
+
+    if not draft_answer:
+        draft_answer = "Jag kan inte formulera ett säkert svar eftersom underlaget är otillräckligt."
+
+    # 2) Criteria check against evidence_items
+    #criteria_items = parse_criteria_items(krav_lista)
+    review_result = CriteriaReviewResult(findings=[])
+
+    try:
+        review_llm = review_llm.with_structured_output(CriteriaReviewResult)
+        raw_review_result = review_llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                            """
+                                Du är Review-agent i en Financial Due Diligence-agent.
+
+                                Uppgift: jämför företages interna krav-lista mot given evidens och returnera endast CriteriaReviewResult. Målet är att skapa användbart beslutsunderlag.
+
+                                Viktig semantik:
+                                - "Uppfyllt" = evidensen innehåller tillräcklig information för att besvara eller bedöma kriteriet.
+                                - "Ej uppfyllt" = evidensen visar explicit att kriteriet inte är uppfyllt, eller att en risk/brist finns.
+                                - "Konflikt" = Om du upptäcker något i evidensen som motsäger ett kriterium. 
+                                - "Relevant" = Evidens är relevant kunskap kopplad till ett krterium 
+                                - Om evidensen inte berör kriteriet: utelämna kriteriet.
+                                - Dra aldrig slutsats från tystnad. Saknad evidens är inte samma sak som "Ej uppfyllt".
+
+                                Regler:
+                                - Bedöm endast kriterier som har direkt stöd i evidensen.
+                                - Använd endast evidens-ID:n som finns i underlaget.
+                                - supporting_evidence_ids ska innehålla relevanta E-ID:n, t.ex. ["E1", "E3"].
+                                - Motivation ska vara kort, konkret och evidensbaserad.
+                                - Skilj på bevisad uppgift, indikation och saknad information.
+                                - Hitta inte på belopp, avtal, risker, parter eller slutsatser.
+                                - Om inget kriterium kan bedömas utifrån evidensen, returnera findings=[]
+
+                                Bedömningslogik:
+                                1. Läs varje kriterium separat.
+                                2. Kontrollera om evidensen explicit berör kriteriet.
+                                3. Om ja, avgör status enligt definitionen ovan.
+                                4. Ange kort motivation och stödjande evidens-ID:n.
+                                5. Om nej, ta inte med kriteriet.
+                                """ 
+                        )
+                ),
+                HumanMessage(
+                    content=f"""
+                krav-lista:
+                {krav_lista}
+
+                Evidens:
+                {evidence_context}
+                """
+                ),
+            ]
+        )
+
+        if raw_review_result is None:
+            review_result = CriteriaReviewResult(findings=[])
+        elif isinstance(raw_review_result, CriteriaReviewResult):
+            review_result = raw_review_result
+        elif isinstance(raw_review_result, dict):
+            review_result = CriteriaReviewResult(**raw_review_result)
+        else:
+            review_result = CriteriaReviewResult(findings=[])
+
+    except Exception as e:
+        print("Review parsing failed:", repr(e))
+        review_result = CriteriaReviewResult(findings=[])
+
+    # 3) Keep only evidence actually cited in the final answer
+    valid_evidence_ids = {e.evidence_id for e in evidence_items}
+    used_ids = [eid for eid in extract_evidence_ids(draft_answer) if eid in valid_evidence_ids]
+
+    all_evidence = mark_used_evidence(evidence_items, used_ids)
+    used_evidence = keep_only_used_evidence(all_evidence)
+
+    if not used_ids and evidence_items:
+        citation_repair_prompt = """
+        Lägg till evidenshänvisningar i formatet [E1] eller [E1, E2] i svaret.
+        Ändra inte innehållet mer än nödvändigt.
+        Använd endast evidens-ID som finns i underlaget.
+        """
+
+        repair_response = answer_llm.invoke(
+            [
+                SystemMessage(content=citation_repair_prompt),
+                HumanMessage(
+                    content=f"Svar utan korrekt citering:\n{draft_answer}\n\nTillgänglig evidens:\n{evidence_context}"
+                ),
+            ]
+        )
+        draft_answer = extract_final_text(repair_response.content)
+        used_ids = [eid for eid in extract_evidence_ids(draft_answer) if eid in valid_evidence_ids]
+
+    effective_evidence = used_evidence
+
+    used_sources = dedupe_sources([e.source for e in effective_evidence])
+    grouped_sources = group_sources_by_page(used_sources)
+    grouped_evidence = group_evidence_by_page(effective_evidence)
+
+    final_payload = MultiFinalAnswer(
+        Answer=draft_answer,
+        Review=review_result.findings,
+        EvidenceTrail=effective_evidence,
+        query_plan=qp,
+    )
+
+    if final_payload.Review:
+        review_text = "\n".join(
+            (
+                f"- {item.criterion}: {item.status} – {item.motivation}"
+                + (
+                    f" | evidens: [{', '.join(item.supporting_evidence_ids)}]"
+                    if item.supporting_evidence_ids else ""
+                )
+            )
+            for item in final_payload.Review
+        )
+    else:
+        review_text = "- Inga kriterier kunde explicit bedömas utifrån evidensen."
+
+    evidence_text_output = (
+        "\n".join(
+            f"- {e['doc_id']} | page {e['page']} | evidence item [{', '.join(e['evidence_ids'])}] "
+            for e in grouped_evidence
+        )
+        or "- Ingen explicit evidens citerades i svaret"
+    )
+
+    final_text = (
+        f"Svar:\n"
+        f"{final_payload.Answer}\n\n"
+        f"Bedömning mot kriterielistan:\n"
+        f"{review_text}\n\n"
+        f"Evidensspår:\n"
+        f"{evidence_text_output}\n\n"
+        #f"Källor:\n"
+        #f"{source_text}"
+    )
+
+    return {
+        "final_output": final_payload.model_dump(),
+        "messages": [AIMessage(content=final_text)],
+        "ready_to_finalize": True,
+    }
+
+# 6) Routing
+def should_continue(state: MultiAugustState):
+    ready = state.get("ready_to_finalize")
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+
+    print(
+        "[ROUTER]",
+        {
+            "ready_to_finalize": ready,
+            "last_message_type": type(last).__name__,
+            "tool_call_count": len(tool_calls),
+            "messages_count": len(state.get("messages", [])),
+            "tool_observation_count": len(state.get("tool_observations", [])),
+            "evidence_count": len(state.get("evidence_items", [])),
+        },
+        flush=True,
+    )
+
+    if ready:
+        print("[ROUTER] -> finalizer", flush=True)
+        return "finalizer"
+
+    if tool_calls:
+        print("[ROUTER] -> tool_node", flush=True)
+        return "tool_node"
+
+    print("[ROUTER] -> finalizer because no tool call was produced", flush=True)
+    return "finalizer"
+
+
+# 7) Build graph
+builder = StateGraph(MultiAugustState)
+# Nodes
+builder.add_node("query_planner", query_planner_node)
+builder.add_node("task_handler", task_handler_node)
+builder.add_node("tool_node", tool_node)
+builder.add_node("finalizer", finalizer_node)
+#Edges
+builder.add_edge(START, "query_planner")
+builder.add_edge("query_planner", "task_handler")
+builder.add_conditional_edges(
+    "task_handler",
+    should_continue,
+    {
+        "tool_node": "tool_node",
+        "finalizer": "finalizer",
+    },
+)
+builder.add_edge("tool_node", "task_handler")
+builder.add_edge("finalizer", END)
+# Compile
+agent = builder.compile()
+
+# prints
+print(query)
+display(Image(agent.get_graph().draw_mermaid_png()))
+
+# 8) Invoke
+result = agent.invoke(
+    {
+        "messages": [HumanMessage(content=query)],
+        "user_query": "",
+        "query_plan": {},
+        "tool_observations": [],
+        "latest_tool_results": [],
+        "navigation_memory": empty_navigation_memory(),
+        "evidence_items": [],
+        "ready_to_finalize": False,
+        "final_output": {},
+    },
+)
+
+print(result["messages"][-1].content)
+print(f"\nTool calls used: {count_tool_calls(result)}")
+# 4.1) Single August
+
+# prompts / tools
+prompt = (
+    "Du är en agent specialiserad på Financial Due Diligence i fastighetsbranschen. "
+    "Du får en fråga från en medarbetare samt kopmliterande information som du ska besvara enbart med stöd i datarummet."
+    "Börja normalt med verktyget 'similarity_search' för att hitta relevanta element. "
+    "Använd 'sheet_labels' för att hämta alla namn på 'rad-labels' och 'kolumn-labels' för ett excel ark."
+    "Om du hittar relevanta text- eller table-element, använd 'clause_lookup' för att läsa innehållet. "
+    "Om du hittar relevanta sheet-element, använd 'sheet_lookup' för att läsa strukturerade värden. "
+    "Om du behöver mer lokal kontext runt ett element, använd 'find_neighbours'. "
+    "När du har tillräckligt underlag ska du sluta använda verktyg och skriva ett slutligt svar. "
+    "Varje faktapåstående i slutsvaret måste ha minst en evidensreferens i formatet [E1] eller [E1, E2]. "
+    "Använd endast evidens-ID:n som faktiskt finns i evidenslistan. "
+    "Om evidens saknas ska du säga det tydligt."
+)
+
+# After tools are defined
+tools = [similarity_search, sheet_labels, sheet_lookup, clause_lookup, find_neighbours]
+tools_by_name = {t.name: t for t in tools}
+
+llm5_with_tools = llm5.bind_tools(tools, tool_choice="auto")
+
+
+def build_evidence_from_observation(
+    observation: Dict[str, Any],
+    existing_items: List[EvidenceItem],
+) -> List[EvidenceItem]:
+    tool_name = observation.get("tool", "")
+    tool_args = observation.get("tool_args", {}) or {}
+
+    tool_result = normalize_raw_tool_result(
+        raw_observation=observation,
+        tool_name=tool_name,
+        tool_args=tool_args,
+    )
+
+    return build_evidence_from_tool_result(
+        tool_result=tool_result,
+        existing_items=existing_items,
+    )
+
+
+# Final answer text only from the model.
+# Sources and EvidenceTrail are assembled deterministically from state.
+class FinalAnswerText(BaseModel):
+    Answer: str = Field(
+        ...,
+        description=(
+            "Besvara frågan så noggrant som möjligt med hjälp av information du kan hitta i datarummet. "
+            "Varje faktapåstående måste ha minst en evidensreferens i formatet [E1] eller [E1, E2]. "
+            "Om du inte hittar relevant information ska du uttrycka det tydligt."
+        ),
+    )
+
+
+def render_final_message(final_output: Dict[str, Any]) -> str:
+    answer = final_output.get("Answer", "") or ""
+    evidence_trail = final_output.get("EvidenceTrail", []) or []
+
+    grouped = group_evidence_by_page(evidence_trail)
+
+    if not grouped:
+        return answer
+
+    source_lines = []
+    for g in grouped:
+        evid = ", ".join(g.get("evidence_ids", []))
+        page = g.get("page")
+        doc_id = g.get("doc_id")
+        page_text = f"page {page}" if page is not None else "page ?"
+        source_lines.append(f"{doc_id}, evidence item [{evid}], {page_text}")
+
+    return answer + "\n\nSources:\n" + "\n".join(source_lines)
+
+# Agent
+def llm_call(state: SingleAugustState):
+    system = SystemMessage(content=prompt)
+
+    response = llm5_with_tools.invoke([system] + state["messages"])
+
+    if getattr(response, "tool_calls", None):
+        return {"messages": [response]}
+
+    evidence_items = [
+        EvidenceItem(**e) if isinstance(e, dict) else e
+        for e in state.get("evidence_items", [])
+    ]
+
+    user_query = state.get("query", "") or ""
+    if not user_query:
+        for m in state.get("messages", []):
+            if isinstance(m, HumanMessage):
+                user_query = m.content
+                break
+
+    evidence_block_parts = []
+    for e in evidence_items:
+        citation = (e.structured_data or {}).get("citation")
+        citation_part = f" | {citation}" if citation else ""
+
+        evidence_block_parts.append(
+            f"[{e.evidence_id}] "
+            f"{e.source.doc_id} | {e.source.element_id} | page {e.source.page}{citation_part}\n"
+            f"{e.context}"
+        )
+
+    evidence_block = "\n\n".join(evidence_block_parts).strip()
+    if not evidence_block:
+        evidence_block = "Ingen evidens har hämtats från verktygen."
+
+    try:
+        final_answer_response = llm5.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Du skriver slutsvaret för en Financial Due Diligence-agent. "
+                        "Svara endast med stöd i evidensen. "
+                        "Varje faktapåstående måste ha minst en evidensreferens i formatet [E1] eller [E1, E2]. "
+                        "Använd endast evidens-ID:n som faktiskt finns i underlaget. "
+                        "Om underlag saknas ska du säga det tydligt. "
+                        "Svara endast med själva slutsvaret som vanlig text, inte som JSON."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Fråga:\n{user_query}\n\n"
+                        f"Evidens:\n{evidence_block}"
+                    )
+                ),
+            ]
+        )
+
+        answer_text = extract_final_text(final_answer_response).strip()
+
+    except Exception as e:
+        print("[FINAL ANSWER ERROR]", repr(e))
+        answer_text = ""
+
+    if not answer_text:
+        answer_text = (
+            "Jag kunde inte generera ett stabilt slutsvar från modellen. "
+            "Underlaget kan vara otillräckligt eller svaret gick inte att tolka."
+        )
+
+    used_ids = extract_evidence_ids(answer_text)
+    marked_evidence = mark_used_evidence(evidence_items, used_ids)
+    used_evidence = keep_only_used_evidence(marked_evidence)
+
+    final_sources = dedupe_sources([
+        SourceRef(
+            doc_id=e.source.doc_id,
+            element_id=e.source.element_id,
+            page=e.source.page,
+            element_type=e.source.element_type,
+        )
+        for e in used_evidence
+    ])
+
+    final_output_obj = SingleFinalAnswer(
+        Answer=answer_text,
+        Sources=final_sources,
+        EvidenceTrail=used_evidence,
+    )
+
+    final_output = final_output_obj.model_dump(mode="json")
+    final_message = AIMessage(
+        content=render_final_message(final_output),
+        response_metadata=getattr(final_answer_response, "response_metadata", {}),
+        usage_metadata=getattr(final_answer_response, "usage_metadata", None),
+        additional_kwargs=getattr(final_answer_response, "additional_kwargs", {}),
+    )
+
+    return {
+        "messages": [final_message],
+        "sources": final_sources,
+        "evidence_items": marked_evidence,
+        "final_output": final_output,
+    }
+
+# Tool node
+def tool_node(state: SingleAugustState):
+    results = []
+    new_sources = []
+    new_evidence = []
+
+    existing_evidence = [
+        EvidenceItem(**e) if isinstance(e, dict) else e
+        for e in state.get("evidence_items", [])
+    ]
+
+    for tool_call in state["messages"][-1].tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        # Validera/routa enligt din tidigare kod
+        validated_tool_name, validated_tool_args, routed_observation = validate_or_route_tool_call(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            state={
+                "messages": state.get("messages", []),
+                "user_query": state.get("query", ""),
+                "query_plan": {},
+                "tool_observations": [],
+                "evidence_items": state.get("evidence_items", []),
+                "ready_to_finalize": False,
+                "final_output": state.get("final_output", {}),
+            },
+        )
+
+        if routed_observation is not None:
+            observation = routed_observation.model_dump()
+        else:
+            observation = safe_invoke_tool(validated_tool_name, validated_tool_args)
+
+        # Lägg till tool-svar i messages så LLM kan läsa det
+        results.append(
+            ToolMessage(
+                content=json.dumps(observation, ensure_ascii=False, default=str),
+                tool_call_id=tool_call["id"],
+            )
+        )
+
+        # Samla sources
+        obs_sources = [
+            SourceRef(**s) if isinstance(s, dict) else s
+            for s in observation.get("sources", [])
+        ]
+        new_sources.extend(obs_sources)
+
+        # Bygg evidens via din befintliga kompatibla helper
+        observation_for_evidence = dict(observation)
+        observation_for_evidence["tool_args"] = validated_tool_args
+
+        built_items = build_evidence_from_observation(
+            observation=observation_for_evidence,
+            existing_items=existing_evidence + new_evidence,
+        )
+
+        new_evidence.extend(built_items)
+
+    return {
+        "messages": results,
+        "sources": dedupe_sources(state.get("sources", []) + new_sources),
+        "evidence_items": existing_evidence + new_evidence,
+    }
+
+# 6) Routing
+def should_continue(state: SingleAugustState):
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tool_node"
+    return END
+
+
+# 7) Build graph
+builder = StateGraph(SingleAugustState)
+
+# nodes
+builder.add_node("llm_call", llm_call)
+builder.add_node("tool_node", tool_node)
+
+# edges
+builder.add_edge(START, "llm_call")
+builder.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
+builder.add_edge("tool_node", "llm_call")
+
+# compile
+agent = builder.compile()
+
+print(query)
+display(Image(agent.get_graph().draw_mermaid_png()))
+
+
+# 8) Invoke
+result = agent.invoke(
+    {
+        "query": query,
+        "messages": [HumanMessage(content=query)],
+        "sources": [],
+        "evidence_items": [],
+        "final_output": {},
+    },
+    config={"recursion_limit": 30}
+)
+
+print(result["messages"][-1].content)
+print(f"\nTool calls used: {count_tool_calls(result)}")
+
+# Optional:
+#print(result["evidence_items"])
+# print(json.dumps(result["final_output"], ensure_ascii=False, indent=2, default=str))
+# 4) Multi August (edits)
+
+# 1) Tools
+tools = [similarity_search, sheet_labels, sheet_lookup, clause_lookup, find_neighbours]
+tools_by_name = {t.name: t for t in tools}
+
+# 3) Nodes
+
+# Query Planner
+def query_planner_node(state: MultiAugustState):
+
+    planer_llm = llm1
+
+    human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+
+    #Fallback if no query
+    if not human_messages:
+        empty_plan = QueryPlan(
+            original_query="",
+            rewritten_query="",
+            task_type="blandat",
+            search_terms=[],
+            answer_criteria=[],
+        )
+        return {
+            "user_query": "",
+            "query_plan": empty_plan.model_dump(),
+            "ready_to_finalize": False,
+        }
+
+    #Fallback if no plan
+    user_query = str(human_messages[-1].content).strip()
+
+    fallback_plan = QueryPlan(
+        original_query=user_query,
+        rewritten_query=user_query,
+        task_type="blandat",
+        search_terms=[user_query] if user_query else [],
+        answer_criteria=[
+            "Svaret ska bygga enbart på explicit evidens från datarummet.",
+            "Om uppgiften kräver siffror eller villkor måste dessa kunna hämtas från källorna.",
+            "Om underlag saknas ska detta sägas tydligt.",
+        ],
+    )
+
+    planner_prompt = """
+        Returnera endast ett QueryPlan-objekt.
+        Var konservativ.
+        Behåll användarens intention exakt.
+        Hitta inte på labels, dokument eller källor.
+        Använd tomma listor hellre än att gissa.
+        """
+
+
+    try:
+        planner_llm = planer_llm.with_structured_output(QueryPlan)
+        raw_plan = planner_llm.invoke(
+            [
+                SystemMessage(content=planner_prompt),
+                HumanMessage(content=user_query),
+            ]
+        )
+        # Write plan to state
+        if isinstance(raw_plan, QueryPlan):
+            plan = raw_plan.model_copy(
+                update={
+                    "original_query": user_query,
+                    "rewritten_query": (raw_plan.rewritten_query or user_query).strip(),
+                    "search_terms": _normalize_list(raw_plan.search_terms),
+                    "answer_criteria": _normalize_list(raw_plan.answer_criteria),
+                }
+            )
+            print(plan)
+        # If planner fails and plan is written as a dict
+        elif isinstance(raw_plan, dict):
+            plan = QueryPlan(
+                original_query=user_query,
+                rewritten_query=str(raw_plan.get("rewritten_query") or user_query).strip(),
+                task_type=raw_plan.get("task_type") or "blandat",
+                search_terms=_normalize_list(raw_plan.get("search_terms")),
+                answer_criteria=_normalize_list(raw_plan.get("answer_criteria")),
+            )
+            print(plan)
+        else:
+            plan = fallback_plan
+            #rint(plan)
+
+    except Exception as e:
+        print("Query planning failed:", repr(e))
+        plan = fallback_plan
+        print(plan)
+
+    return {
+        "user_query": user_query,
+        "query_plan": plan.model_dump(),
+        "ready_to_finalize": False,
+    }
+
+task_llm_with_tools = llm2.bind_tools(tools)
+
+TASK_HANDLER_PROMPT_SHORT = """
+Du är Task Handler i en Financial Due Diligence-agent.
+
+Din uppgift är att styra informationsinhämtningen steg för steg tills det finns tillräcklig evidens för att besvara användarens fråga utifrån datarummet.
+
+Regler:
+- Endast clause_lookup och sheet_lookup skapar evidens.
+- similarity_search, find_neighbours och sheet_labels är endast navigation.
+- Om du endast har navigationsresultat och frågan kräver fakta, fortsätt med clause_lookup eller sheet_lookup.
+- Upprepa inte samma tool call.
+- Avsluta utan tool call endast om evidensen räcker, eller om det tydligt inte går att komma längre.
+- Om ingen evidens finns ännu, börja normalt med similarity_search.
+"""
+
+# Task Handler
+def task_handler_node(state: MultiAugustState):
+    anti_loop_number = 5
+
+    qp = _coerce_query_plan(state)
+
+    human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+    user_query = state.get("user_query", "") or (
+        str(human_messages[-1].content).strip() if human_messages else ""
+    )
+
+    existing_evidence = _normalize_evidence_items(state.get("evidence_items", []))
+    latest_tool_results = _normalize_tool_result_records(
+        state.get("latest_tool_results", []) or []
+    )
+
+    new_evidence = _collect_new_evidence_from_tool_results(
+        tool_results=latest_tool_results,
+        existing_items=existing_evidence,
+    )
+    all_evidence = existing_evidence + new_evidence
+
+    # Anti-loop check
+    recent_observations_for_loop = (state.get("tool_observations", []) or [])[-anti_loop_number:]
+    no_new_evidence_recent = False
+
+    if len(recent_observations_for_loop) >= anti_loop_number:
+        last_n_results = recent_observations_for_loop[-anti_loop_number:]
+        no_new_evidence_recent = all(
+            (obs.get("result_count", 0) == 0)
+            or (obs.get("status") in {"BLOCKED", "ERROR", "No"})
+            for obs in last_n_results
+        )
+
+    if no_new_evidence_recent:
+        print(f"[TASK_HANDLER] ANTI-LOOP TRIGGERED: senaste {anti_loop_number} observationerna gav ingen ny användbar signal")
+        return {
+            "messages": [],
+            "evidence_items": new_evidence,
+            "ready_to_finalize": True,
+        }
+
+    context = compact_state_for_task_handler(
+        state=state,
+        user_query=user_query,
+        query_plan=qp,
+        latest_tool_results=latest_tool_results,
+        evidence_items=all_evidence,
+    )
+
+    response = task_llm_with_tools.invoke(
+        [
+            SystemMessage(content=TASK_HANDLER_PROMPT_SHORT),
+            HumanMessage(content=json.dumps(context, ensure_ascii=False, default=str)),
+        ]
+    )
+
+    has_tool_calls = bool(getattr(response, "tool_calls", None))
+    has_real_evidence = any(e.tool in {"clause_lookup", "sheet_lookup"} for e in all_evidence)
+
+    ready_to_finalize = not has_tool_calls
+
+    # Important: avoid task_handler -> task_handler infinite loop
+    if ready_to_finalize and not has_real_evidence:
+        has_prior_tool_attempts = bool(state.get("tool_observations", []))
+
+        if not has_prior_tool_attempts and user_query:
+            response = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "similarity_search",
+                        "args": {"query_text": qp.rewritten_query or user_query},
+                        "id": f"call_{uuid.uuid4().hex}",
+                    }
+                ],
+            )
+            ready_to_finalize = False
+        else:
+            # Let finalizer say evidence is insufficient
+            ready_to_finalize = True
+
+    return {
+        "messages": [response],
+        "evidence_items": new_evidence,
+        "ready_to_finalize": ready_to_finalize,
+    }
+
+def tool_node(state: MultiAugustState):
+    results: List[ToolMessage] = []
+    compact_observations: List[Dict[str, Any]] = []
+    latest_tool_results: List[ToolResultRecord] = []
+
+    last_message = state["messages"][-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+
+    if not tool_calls:
+        return {
+            "messages": [],
+            "tool_observations": [],
+            "latest_tool_results": [],
+        }
+
+    for tool_call in tool_calls:
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("args", {}) or {}
+        tool_call_id = tool_call.get("id")
+
+        if tool_name not in tools_by_name:
+            error_raw = {
+                "tool": tool_name,
+                "status": "ERROR",
+                "message": f"Okänt tool: {tool_name}",
+                "data": [],
+                "sources": [],
+                "tool_args": tool_args,
+            }
+
+            compact = build_compact_tool_observation(error_raw, tool_name, tool_args)
+            normalized_result = normalize_raw_tool_result(error_raw, tool_name, tool_args)
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        resolved_tool_name, resolved_tool_args, validation_error = validate_or_route_tool_call(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            state=state,
+        )
+
+        recent_obs = state.get("tool_observations", [])[-8:]
+        recent_signatures = {
+            _tool_signature(obs.get("tool", ""), obs.get("tool_args", {}) or {})
+            for obs in recent_obs
+        }
+
+        current_sig = _tool_signature(resolved_tool_name, resolved_tool_args)
+
+        if current_sig in recent_signatures:
+            blocked_raw = {
+                "tool": resolved_tool_name,
+                "status": "BLOCKED",
+                "message": "Upprepat tool call blockerades för att undvika loop, pröva något annat.",
+                "data": [],
+                "sources": [],
+                "tool_args": resolved_tool_args,
+            }
+
+            compact = build_compact_tool_observation(blocked_raw, resolved_tool_name, resolved_tool_args)
+            normalized_result = normalize_raw_tool_result(blocked_raw, resolved_tool_name, resolved_tool_args)
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        if validation_error is not None:
+            validation_raw = {
+                "tool": validation_error.tool,
+                "status": validation_error.status,
+                "message": validation_error.message,
+                "data": [],
+                "tool_args": validation_error.tool_args,
+            }
+
+            compact = build_compact_tool_observation(
+                validation_raw,
+                validation_error.tool,
+                validation_error.tool_args,
+            )
+            normalized_result = normalize_raw_tool_result(
+                validation_raw,
+                validation_error.tool,
+                validation_error.tool_args,
+            )
+            normalized_result_dict = normalized_result.model_dump()
+
+            results.append(
+                ToolMessage(
+                    content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                    tool_call_id=tool_call_id,
+                )
+            )
+            compact_observations.append(compact.model_dump())
+            latest_tool_results.append(normalized_result)
+            continue
+
+        tool = tools_by_name[resolved_tool_name]
+
+        try:
+            raw_observation = tool.invoke(resolved_tool_args)
+
+            if not isinstance(raw_observation, dict):
+                raw_observation = {
+                    "tool": resolved_tool_name,
+                    "status": "ERROR",
+                    "message": f"Tool returned non-dict output: {type(raw_observation).__name__}",
+                    "data": [],
+                    "sources": [],
+                }
+
+        except Exception as e:
+            raw_observation = {
+                "tool": resolved_tool_name,
+                "status": "ERROR",
+                "message": f"Tool execution failed: {repr(e)}",
+                "data": [],
+                "sources": [],
+            }
+
+        normalized_result = normalize_raw_tool_result(
+            raw_observation,
+            resolved_tool_name,
+            resolved_tool_args,
+        )
+        normalized_result_dict = normalized_result.model_dump()
+
+        compact = build_compact_tool_observation(
+            normalized_result_dict,
+            resolved_tool_name,
+            resolved_tool_args,
+        )
+
+        results.append(
+            ToolMessage(
+                content=json.dumps(normalized_result_dict, ensure_ascii=False, default=str),
+                tool_call_id=tool_call_id,
+            )
+        )
+
+        compact_observations.append(compact.model_dump())
+        latest_tool_results.append(normalized_result)
+
+    return {
+        "messages": results,
+        "tool_observations": compact_observations,
+        "latest_tool_results": latest_tool_results,
+    }
+
+def finalizer_node(state: MultiAugustState):
+
+    answer_llm = llm3
+    review_llm = llm4
+
+    # Hämta bakgrund: QueryPlan och evidence items
+    qp = _coerce_query_plan(state)
+    user_query = state.get("user_query", "") or qp.original_query
+    evidence_items = _normalize_evidence_items(state.get("evidence_items", []))
+
+    evidence_context = "\n\n---\n\n".join(
+        (
+            f"[{e.evidence_id}]\n"
+            f"Källa: {e.source.doc_id} | element: {e.source.element_id} | "
+            f"sida: {e.source.page} | typ: {e.source.element_type}\n"
+            f"Verktyg: {e.tool}\n"
+            f"Context:\n{e.context}\n"
+            f"Structured data:\n{json.dumps(e.structured_data or {}, ensure_ascii=False, default=str)}"
+        )
+        for e in evidence_items
+    )[:15000]
+
+    if not evidence_context.strip():
+        evidence_context = "Ingen evidens har samlats in."
+
+    # 1) Formulera svar till användarens query baserat på evidence_items
+    answer_prompt = """
+        Du är Finalizer i en Financial Due Diligence-agent. 
+        Du ska besvara frågor från användare i professionell muntlig ton på svenska.
+        Du får endast besvara frågorna utifrån evidensen nedan.
+
+        Din uppgift:
+        - Besvara användarens fråga enbart med stöd i evidensen nedan.
+        - Använd endast explicit information från evidensen.
+        - Skriv inte något som inte kan stödjas av evidensen.
+        - Om evidensen inte räcker ska du säga det tydligt.
+        - Varje faktapåstående ska ha minst en evidensreferens i formatet [E1] eller [E1, E2].
+        - Använd endast evidens-ID:n som faktiskt finns i underlaget.
+        - Skriv ett tydligt och professionellt slutligt svar på svenska i muntlig ton.
+        """
+
+    answer_response = answer_llm.invoke(
+        [
+            SystemMessage(content=answer_prompt),
+            HumanMessage(
+                content=f"""
+
+        Query plan:
+        - original_query: {user_query}
+        - rewritten_query: {qp.rewritten_query}
+
+        Evidens:
+        {evidence_context}
+        """
+            ),
+        ]
+    )
+
+    draft_answer = extract_final_text(answer_response.content)
+
+    if not draft_answer:
+        draft_answer = "Jag kan inte formulera ett säkert svar eftersom underlaget är otillräckligt."
+
+    # 2) Criteria check against evidence_items
+    #criteria_items = parse_criteria_items(krav_lista)
+    review_result = CriteriaReviewResult(findings=[])
+
+    try:
+        review_llm = review_llm.with_structured_output(CriteriaReviewResult)
+        raw_review_result = review_llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                            "Du är sista steget i en FDD-agent och ska jämföra en 'krav-lista' mot 'evidens'.\n"
+                            "Bedöm endast punkter från 'krav-lista' som besvaras i 'evidens'.\n"
+                            "För varje relevant krav ska du sätta status till 'Uppfyllt' eller 'Ej uppfyllt'.\n"
+                            "Varje finding ska ha kort motivation och supporting_evidence_ids när sådana finns.\n"
+                            "Om inget krav besvaras, returnera en tom lista."
+                        )
+                ),
+                HumanMessage(
+                    content=f"""
+                krav-lista:
+                {krav_lista}
+
+                Evidens:
+                {evidence_context}
+                """
+                ),
+            ]
+        )
+
+        if raw_review_result is None:
+            review_result = CriteriaReviewResult(findings=[])
+        elif isinstance(raw_review_result, CriteriaReviewResult):
+            review_result = raw_review_result
+        elif isinstance(raw_review_result, dict):
+            review_result = CriteriaReviewResult(**raw_review_result)
+        else:
+            review_result = CriteriaReviewResult(findings=[])
+
+    except Exception as e:
+        print("Review parsing failed:", repr(e))
+        review_result = CriteriaReviewResult(findings=[])
+
+    # 3) Keep only evidence actually cited in the final answer
+    valid_evidence_ids = {e.evidence_id for e in evidence_items}
+    used_ids = [eid for eid in extract_evidence_ids(draft_answer) if eid in valid_evidence_ids]
+
+    all_evidence = mark_used_evidence(evidence_items, used_ids)
+    used_evidence = keep_only_used_evidence(all_evidence)
+
+    if not used_ids and evidence_items:
+        citation_repair_prompt = """
+        Lägg till evidenshänvisningar i formatet [E1] eller [E1, E2] i svaret.
+        Ändra inte innehållet mer än nödvändigt.
+        Använd endast evidens-ID som finns i underlaget.
+        """
+
+        repair_response = answer_llm.invoke(
+            [
+                SystemMessage(content=citation_repair_prompt),
+                HumanMessage(
+                    content=f"Svar utan korrekt citering:\n{draft_answer}\n\nTillgänglig evidens:\n{evidence_context}"
+                ),
+            ]
+        )
+        draft_answer = extract_final_text(repair_response.content)
+        used_ids = [eid for eid in extract_evidence_ids(draft_answer) if eid in valid_evidence_ids]
+
+    effective_evidence = used_evidence
+
+    used_sources = dedupe_sources([e.source for e in effective_evidence])
+    grouped_sources = group_sources_by_page(used_sources)
+    grouped_evidence = group_evidence_by_page(effective_evidence)
+
+    final_payload = MultiFinalAnswer(
+        Answer=draft_answer,
+        Review=review_result.findings,
+        EvidenceTrail=effective_evidence,
+        query_plan=qp,
+    )
+
+    if final_payload.Review:
+        review_text = "\n".join(
+            (
+                f"- {item.criterion}: {item.status} – {item.motivation}"
+                + (
+                    f" | evidens: [{', '.join(item.supporting_evidence_ids)}]"
+                    if item.supporting_evidence_ids else ""
+                )
+            )
+            for item in final_payload.Review
+        )
+    else:
+        review_text = "- Inga kriterier kunde explicit bedömas utifrån evidensen."
+
+    evidence_text_output = (
+        "\n".join(
+            f"- {e['doc_id']} | page {e['page']} | evidence item [{', '.join(e['evidence_ids'])}] "
+            for e in grouped_evidence
+        )
+        or "- Ingen explicit evidens citerades i svaret"
+    )
+
+    final_text = (
+        f"Svar:\n"
+        f"{final_payload.Answer}\n\n"
+        f"Bedömning mot kriterielistan:\n"
+        f"{review_text}\n\n"
+        f"Evidensspår:\n"
+        f"{evidence_text_output}\n\n"
+        #f"Källor:\n"
+        #f"{source_text}"
+    )
+
+    return {
+        "final_output": final_payload.model_dump(),
+        "messages": [AIMessage(content=final_text)],
+        "ready_to_finalize": True,
+    }
+
+# 6) Routing
+def should_continue(state: MultiAugustState):
+    if state.get("ready_to_finalize"):
+        return "finalizer"
+
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
+        return "tool_node"
+
+    return "task_handler"
+
+
+# 7) Build graph
+builder = StateGraph(MultiAugustState)
+# Nodes
+builder.add_node("query_planner", query_planner_node)
+builder.add_node("task_handler", task_handler_node)
+builder.add_node("tool_node", tool_node)
+builder.add_node("finalizer", finalizer_node)
+#Edges
+builder.add_edge(START, "query_planner")
+builder.add_edge("query_planner", "task_handler")
+builder.add_conditional_edges(
+    "task_handler",
+    should_continue,
+    {
+        "tool_node": "tool_node",
+        "finalizer": "finalizer",
+    },
+)
+builder.add_edge("tool_node", "task_handler")
+builder.add_edge("finalizer", END)
+# Compile
+agent = builder.compile()
+
+# prints
+print(query)
+display(Image(agent.get_graph().draw_mermaid_png()))
+
+# 8) Invoke
+result = agent.invoke(
+    {
+        "messages": [HumanMessage(content=query)],
+        "user_query": "",
+        "query_plan": {},
+        "tool_observations": [],
+        "latest_tool_results": [],
+        "evidence_items": [],
+        "ready_to_finalize": False,
+        "final_output": {},
+    },
+)
+
+print(result["messages"][-1].content)
+print(f"\nTool calls used: {count_tool_calls(result)}")
