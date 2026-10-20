@@ -20,11 +20,13 @@
 dbutils.library.restartPython()
 import os
 
+string warehouse_identificator
+
 ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
 os.environ["DATABRICKS_SERVER_HOSTNAME"] = spark.conf.get(
     "spark.databricks.workspaceUrl"
 )
-os.environ["DATABRICKS_HTTP_PATH"] = "/sql/1.0/warehouses/a64e09f01641a4aa"
+os.environ["DATABRICKS_HTTP_PATH"] = warehouse_identificator
 os.environ["DATABRICKS_TOKEN"] = ctx.apiToken().get()
 
 from importlib.metadata import version
