@@ -1,0 +1,2705 @@
+%sh
+sudo apt-get update -y
+sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-swe
+# 1.1 Python Dependencies
+%pip install pypdfium2==4.30.1 \
+             unstructured==0.16.11 \
+             unstructured-inference==0.8.3 \
+             unstructured.pytesseract==0.3.13 \
+             pdf2image==1.17.0 \
+             pi-heif==0.21.0 \
+             pdfminer.six==20231228 \
+             openpyxl==3.1.5 \
+             databricks-vectorsearch
+
+dbutils.library.restartPython()
+# 1.2 Imports
+
+# Basics
+import json, os, base64, re, requests, io, nltk, hashlib, time
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+from collections import Counter, defaultdict
+
+# Visual & UI
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from PIL import Image
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+
+# PDF & Document Processing
+import pypdfium2 as pdfium
+from pdf2image import convert_from_path
+from unstructured.partition.auto import partition
+from unstructured.partition.pdf import partition_pdf
+from unstructured.partition.image import partition_image
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, FloatType
+from pyspark.sql import Row
+from pyspark.sql.window import Window
+from pyspark.sql import functions as F
+
+# vector search
+from databricks.vector_search.client import VectorSearchClient
+
+#nltk download
+NLTK_DIR = "/tmp/nltk_data"
+os.makedirs(NLTK_DIR, exist_ok=True)
+nltk.data.path.insert(0, NLTK_DIR)
+nltk.download("punkt", download_dir=NLTK_DIR)
+nltk.download("averaged_perceptron_tagger", download_dir=NLTK_DIR)
+plt.rcParams['figure.facecolor'] = 'white'
+
+print("✅ Imports successful. Ready to process documents.")
+# 1.3 Directions
+
+# Create Path to document
+
+# Hyresavtal
+DOC_PATH = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.1.1 Hyresavtal/101001 Örebro kommun hyresavtal 2016 08 01_2 (1).pdf" 
+DOC_PATH_1 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.1.1 Hyresavtal/Tilläggsavtal Rörsträlven fr 2016.pdf"
+
+# Serviceavtal
+DOC_PATH_2 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3 Serviceavtal/101 Nyttjanderätt parkering.pdf"
+DOC_PATH_3 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3 Serviceavtal/100 Tillsynsavtal.pdf"
+DOC_PATH_4 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3 Serviceavtal/101 Nyttjanderätt parkering.pdf"
+DOC_PATH_5 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3 Serviceavtal/101 avtal fjärrvärme 170101.pdf"
+DOC_PATH_6 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3 Serviceavtal/Avtal Handskottning  2017.pdf"
+
+# Leverantörskontra
+DOC_PATH_7 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.4.3 Leverantörsreskontra/2440 Reskontra.pdf"
+DOC_PATH_8 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.4.3 Leverantörsreskontra/2440 Saldobalans.pdf"
+DOC_PATH_9 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.4.3 Leverantörsreskontra/2460 Reskontra.pdf"
+DOC_PATH_10 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.4.3 Leverantörsreskontra/2460 Saldobalans.pdf"
+
+#Fastighetsskatt
+DOC_PATH_11 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.4.1 Fastighetsskatt/Fastighetstaxering Rörströmsälven 2019.pdf"
+
+# Aviseringslista
+DOC_PATH_12 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.1.4 Aviseringslista/Rörströmsälven faktureringslista jan-dec 2020.pdf"
+DOC_PATH_13 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.1.4 Aviseringslista/Rörströmsälven faktureringslista okt-dec 2020.pdf"
+
+# Balandsräkningar
+DOC_PATH_14 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/BR detaljerad - 2018 från Insikt.pdf"
+DOC_PATH_15 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/BR detaljerad - 2018 från Kapell.pdf"
+DOC_PATH_16 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/BR detaljerad - 2019 från Insikt.pdf"
+DOC_PATH_17 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/BR detaljerad - 2019 från Kapell.pdf"
+DOC_PATH_18 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/RR detaljerad - 2018 från Kapell.pdf"
+DOC_PATH_19 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/RR detaljerad - 2019 från Kapell.pdf"
+
+OUT_PATH = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/Testing_ocr_db/output"
+
+# DELTA_TABLE = "dev.acquisition_intelligence.RAG_Delta"
+DELTA_TABLE = "RAG_Delta"
+# MODEL_ENDPOINT = "databricks-gpt-oss-120b"
+MODEL_JSON = "databricks-claude-sonnet-4-6"
+MODEL_SUMMARY = "databricks-claude-haiku-4-5"
+invoke_url_JSON = f"https://adb-763802800317051.11.azuredatabricks.net/serving-endpoints/{MODEL_JSON}/invocations"
+invoke_url_SUMMARY = f"https://adb-763802800317051.11.azuredatabricks.net/serving-endpoints/{MODEL_SUMMARY}/invocations"
+
+
+
+# 2 PDF to Image Generator
+
+DBFS_PDF_PATH = DOC_PATH
+RENDER_DIR = "/tmp/pages"
+os.makedirs(RENDER_DIR, exist_ok=True)
+
+pdf = pdfium.PdfDocument(DBFS_PDF_PATH)
+try:
+    n_pages = len(pdf)
+    print("Number of pages:", n_pages)
+
+    image_paths = []
+    scale = 2.5
+
+    for i in range(n_pages):
+        page = pdf[i]
+        try:
+            bitmap = page.render(scale=scale)
+            pil_img = bitmap.to_pil()
+
+            img_path = os.path.join(RENDER_DIR, f"page_{i+1:02d}.png")
+            pil_img.save(img_path)
+            image_paths.append(img_path)
+
+        finally:
+            # Explicitly release native resources ASAP
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                bitmap.close()
+            except Exception:
+                pass
+
+    print("Sample rendered image:", image_paths[:1])
+
+finally:
+    pdf.close()
+
+def rotate_second_rendered_image_90_right(image_paths: List[str]) -> List[str]:
+    """
+    Rotate the 2nd image in image_paths 90 degrees clockwise (to the right).
+    Overwrites the existing image file and returns image_paths unchanged.
+    """
+    if not image_paths or len(image_paths) < 2:
+        raise ValueError("image_paths must contain at least 2 images.")
+
+    img_path = image_paths[1]  # second page, 0-based index
+
+    with Image.open(img_path) as img:
+        rotated = img.rotate(-90, expand=True)  # clockwise
+        rotated.save(img_path)
+
+    return image_paths
+
+#image_paths = rotate_second_rendered_image_90_right(image_paths)
+# 3 Partitioning and Element list creation
+
+# ============================================================
+# 1) Set up parameters
+# ============================================================
+
+# ---- Config
+MAX_PAGES_TO_PROCESS = len(image_paths)   # set smaller if needed
+STRATEGY = "hi_res"
+HI_RES_MODEL_NAME = "yolox"
+INFER_TABLE_STRUCTURE = True
+LANGUAGES = ["swe"]
+
+# ---- Safety check
+if "image_paths" not in globals() or not image_paths:
+    raise RuntimeError("image_paths is missing/empty. Run your PDF->PNG cell first.")
+
+
+# ============================================================
+# 2) Helper functions
+# ============================================================
+
+def coords_to_xyxy(coords) -> Optional[Tuple[float, float, float, float]]:
+    """Convert Unstructured metadata.coordinates polygon -> bbox (x1, y1, x2, y2)."""
+    if coords is None:
+        return None
+
+    pts = None
+    if hasattr(coords, "points"):
+        pts = getattr(coords, "points", None)
+    elif isinstance(coords, dict):
+        pts = coords.get("points")
+
+    if not pts:
+        return None
+
+    try:
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception:
+        return None
+
+
+def _sort_page_dets_reading_order(page_dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort detections in page reading order: top-to-bottom, then left-to-right."""
+    return sorted(page_dets, key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0]))
+
+
+def _sort_global_dets(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort detections globally by page, then page reading order."""
+    return sorted(
+        dets,
+        key=lambda d: (
+            d.get("page", 0),
+            d["bbox_xyxy"][1] if d.get("bbox_xyxy") is not None else float("inf"),
+            d["bbox_xyxy"][0] if d.get("bbox_xyxy") is not None else float("inf"),
+        ),
+    )
+
+
+def _group_dets_by_page(
+    dets: List[Dict[str, Any]]
+) -> Tuple[Dict[int, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """
+    Group detections by page.
+    Returns:
+      - pages: {page_number: [detections_with_bbox]}
+      - no_bbox_items: detections without bbox (preserved unchanged)
+    """
+    pages: Dict[int, List[Dict[str, Any]]] = {}
+    no_bbox_items: List[Dict[str, Any]] = []
+
+    for d in dets:
+        if d.get("bbox_xyxy") is None:
+            no_bbox_items.append(d)
+            continue
+        pages.setdefault(d["page"], []).append(d)
+
+    return pages, no_bbox_items
+
+# ----------------------------
+# Remapping helpers
+# ----------------------------
+
+def normalize_element_type(cat: Optional[str]) -> str:
+    """
+    Remap raw categories into normalized categories.
+    """
+
+    if not cat:
+        return "Other"
+
+    c = str(cat).strip()
+    c_lower = c.lower()
+
+    #if c_lower in {"other", "unknown"}:
+    #    return "Other
+
+    if c_lower in {"narrativetext", "image","uncategorizedtext", "listitem"}:
+        return "Text"
+
+    if c_lower in {"table"}:
+        return "Table"
+
+    if c_lower in {"figurecaption", "figure_caption"}:
+        return "Title"
+
+    if c_lower == "header":
+        return "Title"
+
+    if c_lower in {"figure", "picture"}:
+        return "Figure"
+
+    return c
+
+
+def _normalize_element_types(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize element types in-place using raw_category when available.
+    """
+    for d in dets:
+        raw_cat = d.get("raw_category", d.get("element_type"))
+        d["element_type"] = normalize_element_type(raw_cat)
+    return dets
+
+def _map_nearest_preceding_title(
+    dets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Assign each element an `element_title` equal to the nearest preceding Title
+    on the same page, based on ascending y1/x1 order.
+
+    Logic
+    -----
+    For each page:
+      - sort elements by ascending y1, then x1
+      - identify all Title elements
+      - split the page into title-led segments:
+          [Title_i, ..., just before Title_(i+1))
+      - assign element_title = raw_text of Title_i for every element in that segment
+
+    Notes
+    -----
+    - Elements before the first Title on a page get element_title = None
+    - Title elements themselves also get element_title set to their own raw_text
+    - The function mutates `dets` in place and also returns it
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        y1_sort = _sort_page_dets_reading_order(pages[page])
+
+        current_title = None
+
+        for d in y1_sort:
+            if _etype(d) == "title":
+                current_title = (d.get("raw_text") or "").strip() or None
+
+            d["element_title"] = current_title
+
+        new_dets.extend(y1_sort)
+
+    # Preserve bbox-less items and ensure key exists there too
+    for d in no_bbox_items:
+        if "element_title" not in d:
+            d["element_title"] = None
+        new_dets.append(d)
+
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+# ----------------------------
+# Clustering helpers
+# ----------------------------
+
+def _cluster_other_detections_one_page(
+    page_dets: List[Dict[str, Any]],
+    breaker_types: set = {"Text", "Table"},
+) -> List[Dict[str, Any]]:
+    """
+    Merge neighboring 'Other' detections in page reading order unless interrupted by
+    a Text or Table element.
+
+    The merged cluster is returned as ONE single Table element.
+
+    NOTE:
+    This is a one-page helper. Use _cluster_other_detections(...) on the full dets list.
+    """
+    dets_sorted = _sort_page_dets_reading_order(page_dets)
+
+    out: List[Dict[str, Any]] = []
+    cluster_items: List[Dict[str, Any]] = []
+
+    def flush_cluster():
+        nonlocal cluster_items
+        if not cluster_items:
+            return
+
+        boxes = [d["bbox_xyxy"] for d in cluster_items if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            cluster_items = []
+            return
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        merged_text = "\n".join(
+            [d["raw_text"] for d in cluster_items if d.get("raw_text")]
+        ).strip() or None
+
+        first = cluster_items[0]
+
+        out.append({
+            "element_id": first["element_id"],
+            "element_type": "Table",
+            "raw_category": first.get("raw_category"),
+            "raw_text": merged_text,
+            "page": first["page"],
+            "bbox_xyxy": (x1, y1, x2, y2),
+        })
+
+        cluster_items = []
+
+    for d in dets_sorted:
+        element_type = d["element_type"]
+
+        if element_type in breaker_types:
+            flush_cluster()
+            out.append(d)
+            continue
+
+        if element_type == "Other":
+            cluster_items.append(d)
+            continue
+
+        out.append(d)
+
+    flush_cluster()
+    return _sort_page_dets_reading_order(out)
+
+
+def _cluster_other_detections(
+    dets: List[Dict[str, Any]],
+    breaker_types: set = {"Text", "Table"},
+) -> List[Dict[str, Any]]:
+    """
+    Page-safe wrapper for clustering 'Other' detections on the full dets list.
+    Mutates dets in place and also returns it.
+    """
+    pages, no_bbox_items = _group_dets_by_page(dets)
+
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_out = _cluster_other_detections_one_page(
+            pages[page],
+            breaker_types=breaker_types,
+        )
+        new_dets.extend(page_out)
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+
+def _cluster_parallel_text_neighbors(
+    dets: List[Dict[str, Any]],
+    y_tolerance: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    Cluster Text elements that are on the same page and have overlapping
+    y-coordinates (vertical span overlap).
+
+    Rules:
+      - Only elements with element_type == "Text" are clustered.
+      - Clustering is done per page.
+      - If A overlaps B in y, and B overlaps C in y, they are merged into
+        the same cluster (transitive grouping).
+      - Each cluster becomes ONE single Text element.
+      - Non-Text elements are preserved unchanged.
+
+    The function MUTATES `dets` in place and also returns it.
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def y_overlaps(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+        tol: float = 0.0,
+    ) -> bool:
+        _, y1a, _, y2a = b1
+        _, y1b, _, y2b = b2
+        return max(y1a, y1b) <= min(y2a, y2b) + tol
+
+    def merge_cluster(cluster: List[Dict[str, Any]]) -> Dict[str, Any]:
+        boxes = [d["bbox_xyxy"] for d in cluster if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return cluster[0]
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        # Keep reading order inside the merged text line
+        cluster_sorted = sorted(
+            cluster,
+            key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0]),
+        )
+
+        merged_text = " ".join(
+            (d.get("raw_text") or "").strip()
+            for d in cluster_sorted
+            if (d.get("raw_text") or "").strip()
+        ).strip() or None
+
+        first = cluster_sorted[0]
+
+        return {
+            "element_id": first["element_id"],
+            "element_type": "Text",
+            "raw_category": first.get("raw_category"),
+            "raw_text": merged_text,
+            "page": first["page"],
+            "bbox_xyxy": (x1, y1, x2, y2),
+        }
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = pages[page]
+
+        text_items = [
+            d for d in page_items
+            if _etype(d) == "text" and d.get("bbox_xyxy") is not None
+        ]
+        other_items = [
+            d for d in page_items
+            if not (_etype(d) == "text" and d.get("bbox_xyxy") is not None)
+        ]
+
+        text_items = _sort_page_dets_reading_order(text_items)
+
+        visited = set()
+        merged_text_items: List[Dict[str, Any]] = []
+
+        for i in range(len(text_items)):
+            if i in visited:
+                continue
+
+            stack = [i]
+            component = []
+            visited.add(i)
+
+            while stack:
+                cur_idx = stack.pop()
+                cur = text_items[cur_idx]
+                component.append(cur)
+
+                for j, cand in enumerate(text_items):
+                    if j in visited:
+                        continue
+                    if y_overlaps(cur["bbox_xyxy"], cand["bbox_xyxy"], tol=y_tolerance):
+                        visited.add(j)
+                        stack.append(j)
+
+            if len(component) == 1:
+                merged_text_items.append(component[0])
+            else:
+                merged_text_items.append(merge_cluster(component))
+
+        page_out = other_items + merged_text_items
+        page_out = _sort_page_dets_reading_order(page_out)
+        new_dets.extend(page_out)
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+def _merge_titles_into_overlapping_text(
+    dets: List[Dict[str, Any]],
+    y_tolerance: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    For each page:
+      - find Text elements
+      - find Title elements
+      - if a Title vertically overlaps a Text element (y-span overlap),
+        merge the Title into that Text element
+      - the merged result remains a single Text element
+
+    Notes
+    -----
+    - Matching is page-local only
+    - A text item can absorb multiple overlapping titles
+    - Title items that get merged are removed as standalone items
+    - Non-overlapping titles remain unchanged
+    - Mutates dets in place and also returns it
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def y_overlaps(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+        tol: float = 0.0,
+    ) -> bool:
+        _, y1a, _, y2a = b1
+        _, y1b, _, y2b = b2
+        return max(y1a, y1b) <= min(y2a, y2b) + tol
+
+    def merge_text_with_titles(
+        text_d: Dict[str, Any],
+        title_list: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        cluster = title_list + [text_d]
+        cluster_sorted = sorted(
+            cluster,
+            key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0]),
+        )
+
+        boxes = [d["bbox_xyxy"] for d in cluster_sorted if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return text_d
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        merged_text = "\n\n".join(
+            txt
+            for txt in (
+                (d.get("raw_text") or "").strip()
+                for d in cluster_sorted
+            )
+            if txt
+        ).strip() or None
+
+        merged = dict(text_d)
+        merged.update({
+            "element_id": text_d["element_id"],
+            "element_type": "Text",
+            "raw_category": text_d.get("raw_category"),
+            "raw_text": merged_text,
+            "page": text_d["page"],
+            "bbox_xyxy": (x1, y1, x2, y2),
+        })
+        return merged
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = _sort_page_dets_reading_order(pages[page])
+
+        text_items = [
+            d for d in page_items
+            if _etype(d) == "text" and d.get("bbox_xyxy") is not None
+        ]
+        title_items = [
+            d for d in page_items
+            if _etype(d) == "title" and d.get("bbox_xyxy") is not None
+        ]
+        other_items = [
+            d for d in page_items
+            if _etype(d) not in {"text", "title"} or d.get("bbox_xyxy") is None
+        ]
+
+        used_title_ids = set()
+        merged_text_items: List[Dict[str, Any]] = []
+
+        for text_d in text_items:
+            text_box = text_d["bbox_xyxy"]
+
+            overlapping_titles = []
+            for title_d in title_items:
+                if title_d["element_id"] in used_title_ids:
+                    continue
+                if y_overlaps(text_box, title_d["bbox_xyxy"], tol=y_tolerance):
+                    overlapping_titles.append(title_d)
+
+            if overlapping_titles:
+                merged_text_items.append(merge_text_with_titles(text_d, overlapping_titles))
+                for t in overlapping_titles:
+                    used_title_ids.add(t["element_id"])
+            else:
+                merged_text_items.append(text_d)
+
+        remaining_titles = [
+            d for d in title_items
+            if d["element_id"] not in used_title_ids
+        ]
+
+        page_out = other_items + remaining_titles + merged_text_items
+        page_out = _sort_page_dets_reading_order(page_out)
+        new_dets.extend(page_out)
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+
+def _merge_titles_into_overlapping_tables(
+    dets: List[Dict[str, Any]],
+    y_tolerance: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    For each page:
+      - find Table elements
+      - find Title elements
+      - if a Title vertically overlaps a Table element (y-span overlap),
+        merge the Title into that Table element
+      - the merged result remains a single Table element
+
+    Notes
+    -----
+    - Matching is page-local only
+    - A table item can absorb multiple overlapping titles
+    - Title items that get merged are removed as standalone items
+    - Non-overlapping titles remain unchanged
+    - Mutates dets in place and also returns it
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def y_overlaps(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+        tol: float = 0.0,
+    ) -> bool:
+        _, y1a, _, y2a = b1
+        _, y1b, _, y2b = b2
+        return max(y1a, y1b) <= min(y2a, y2b) + tol
+
+    def merge_table_with_titles(
+        table_d: Dict[str, Any],
+        title_list: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        cluster = title_list + [table_d]
+        cluster_sorted = sorted(
+            cluster,
+            key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0]),
+        )
+
+        boxes = [d["bbox_xyxy"] for d in cluster_sorted if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return table_d
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        merged_text = "\n\n".join(
+            txt
+            for txt in (
+                (d.get("raw_text") or "").strip()
+                for d in cluster_sorted
+            )
+            if txt
+        ).strip() or None
+
+        merged = dict(table_d)
+        merged.update({
+            "element_id": table_d["element_id"],
+            "element_type": "Table",
+            "raw_category": table_d.get("raw_category"),
+            "raw_text": merged_text,
+            "page": table_d["page"],
+            "bbox_xyxy": (x1, y1, x2, y2),
+        })
+        return merged
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = _sort_page_dets_reading_order(pages[page])
+
+        table_items = [
+            d for d in page_items
+            if _etype(d) == "table" and d.get("bbox_xyxy") is not None
+        ]
+        title_items = [
+            d for d in page_items
+            if _etype(d) == "title" and d.get("bbox_xyxy") is not None
+        ]
+        other_items = [
+            d for d in page_items
+            if _etype(d) not in {"table", "title"} or d.get("bbox_xyxy") is None
+        ]
+
+        used_title_ids = set()
+        merged_table_items: List[Dict[str, Any]] = []
+
+        for table_d in table_items:
+            table_box = table_d["bbox_xyxy"]
+
+            overlapping_titles = []
+            for title_d in title_items:
+                if title_d["element_id"] in used_title_ids:
+                    continue
+                if y_overlaps(table_box, title_d["bbox_xyxy"], tol=y_tolerance):
+                    overlapping_titles.append(title_d)
+
+            if overlapping_titles:
+                merged_table_items.append(
+                    merge_table_with_titles(table_d, overlapping_titles)
+                )
+                for t in overlapping_titles:
+                    used_title_ids.add(t["element_id"])
+            else:
+                merged_table_items.append(table_d)
+
+        remaining_titles = [
+            d for d in title_items
+            if d["element_id"] not in used_title_ids
+        ]
+
+        page_out = other_items + remaining_titles + merged_table_items
+        page_out = _sort_page_dets_reading_order(page_out)
+        new_dets.extend(page_out)
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+def _cluster_parallel_title_neighbors(
+    dets: List[Dict[str, Any]],
+    y_tolerance: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    Cluster Title elements that are on the same page and have overlapping
+    y-coordinates (vertical span overlap).
+
+    Rules:
+      - Only elements with element_type == "Title" are clustered
+      - Clustering is done per page
+      - If A overlaps B in y, and B overlaps C in y, they are merged into
+        the same cluster (transitive grouping)
+      - Each cluster becomes ONE single Title element
+      - Non-Title elements are preserved unchanged
+
+    Mutates `dets` in place and also returns it.
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def y_overlaps(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+        tol: float = 0.0,
+    ) -> bool:
+        _, y1a, _, y2a = b1
+        _, y1b, _, y2b = b2
+        return max(y1a, y1b) <= min(y2a, y2b) + tol
+
+    def merge_cluster(cluster: List[Dict[str, Any]]) -> Dict[str, Any]:
+        boxes = [d["bbox_xyxy"] for d in cluster if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return cluster[0]
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+
+        cluster_sorted = sorted(
+            cluster,
+            key=lambda d: (d["bbox_xyxy"][1], d["bbox_xyxy"][0]),
+        )
+
+        merged_text = " ".join(
+            (d.get("raw_text") or "").strip()
+            for d in cluster_sorted
+            if (d.get("raw_text") or "").strip()
+        ).strip() or None
+
+        first = cluster_sorted[0]
+
+        merged = dict(first)
+        merged.update({
+            "element_id": first["element_id"],
+            "element_type": "Title",
+            "raw_category": first.get("raw_category"),
+            "raw_text": merged_text,
+            "page": first["page"],
+            "bbox_xyxy": (x1, y1, x2, y2),
+        })
+        return merged
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = pages[page]
+
+        title_items = [
+            d for d in page_items
+            if _etype(d) == "title" and d.get("bbox_xyxy") is not None
+        ]
+        other_items = [
+            d for d in page_items
+            if not (_etype(d) == "title" and d.get("bbox_xyxy") is not None)
+        ]
+
+        title_items = _sort_page_dets_reading_order(title_items)
+
+        visited = set()
+        merged_title_items: List[Dict[str, Any]] = []
+
+        for i in range(len(title_items)):
+            if i in visited:
+                continue
+
+            stack = [i]
+            component = []
+            visited.add(i)
+
+            while stack:
+                cur_idx = stack.pop()
+                cur = title_items[cur_idx]
+                component.append(cur)
+
+                for j, cand in enumerate(title_items):
+                    if j in visited:
+                        continue
+                    if y_overlaps(cur["bbox_xyxy"], cand["bbox_xyxy"], tol=y_tolerance):
+                        visited.add(j)
+                        stack.append(j)
+
+            if len(component) == 1:
+                merged_title_items.append(component[0])
+            else:
+                merged_title_items.append(merge_cluster(component))
+
+        page_out = other_items + merged_title_items
+        page_out = _sort_page_dets_reading_order(page_out)
+        new_dets.extend(page_out)
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+def _cluster_consecutive_text_blocks(
+    dets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge consecutive Text elements on the same page in reading order.
+
+    A text run is clustered into one Text object if the items are adjacent
+    in page reading order, BUT clustering is blocked if the would-be merged
+    text bbox overlaps any Title or Table element on the same page.
+
+    Practical effect:
+      - Title / Table always break clustering
+      - Figure / Other / etc do not break clustering
+      - page boundaries always block clustering
+      - a text cluster is prevented from expanding across regions occupied by
+        Title or Table elements
+
+    Mutates `dets` in place and also returns it.
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def boxes_overlap(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+    ) -> bool:
+        x1a, y1a, x2a, y2a = b1
+        x1b, y1b, x2b, y2b = b2
+        return not (x2a < x1b or x2b < x1a or y2a < y1b or y2b < y1a)
+
+    def merged_bbox(cluster: List[Dict[str, Any]]) -> Optional[Tuple[float, float, float, float]]:
+        boxes = [d["bbox_xyxy"] for d in cluster if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return None
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+        return (x1, y1, x2, y2)
+
+    def merge_cluster(cluster: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if len(cluster) == 1:
+            return cluster[0]
+
+        cluster_sorted = _sort_page_dets_reading_order(cluster)
+        bbox = merged_bbox(cluster_sorted)
+
+        if bbox is None:
+            return cluster_sorted[0]
+
+        merged_text = "\n\n".join(
+            txt
+            for txt in (
+                (d.get("raw_text") or "").strip()
+                for d in cluster_sorted
+            )
+            if txt
+        ).strip() or None
+
+        first = cluster_sorted[0]
+
+        merged = dict(first)
+        merged.update({
+            "element_id": first["element_id"],
+            "element_type": "Text",
+            "raw_category": first.get("raw_category"),
+            "raw_text": merged_text,
+            "page": first["page"],
+            "bbox_xyxy": bbox,
+        })
+        return merged
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = _sort_page_dets_reading_order(pages[page])
+
+        blocker_boxes = [
+            d["bbox_xyxy"]
+            for d in page_items
+            if _etype(d) in {"title", "table"} and d.get("bbox_xyxy") is not None
+        ]
+
+        page_out: List[Dict[str, Any]] = []
+        text_cluster: List[Dict[str, Any]] = []
+
+        def flush_cluster():
+            nonlocal text_cluster
+            if not text_cluster:
+                return
+            page_out.append(merge_cluster(text_cluster))
+            text_cluster = []
+
+        for d in page_items:
+            et = _etype(d)
+
+            if et == "text":
+                if not text_cluster:
+                    text_cluster.append(d)
+                else:
+                    candidate_cluster = text_cluster + [d]
+                    candidate_bbox = merged_bbox(candidate_cluster)
+
+                    overlaps_blocker = (
+                        candidate_bbox is not None
+                        and any(boxes_overlap(candidate_bbox, bb) for bb in blocker_boxes)
+                    )
+
+                    if overlaps_blocker:
+                        flush_cluster()
+                        text_cluster.append(d)
+                    else:
+                        text_cluster.append(d)
+
+            elif et in {"title", "table"}:
+                flush_cluster()
+                page_out.append(d)
+
+            else:
+                # Figure / Other / etc do not break the text run
+                continue
+
+        flush_cluster()
+        new_dets.extend(_sort_page_dets_reading_order(page_out))
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+def _cluster_consecutive_table_blocks(
+    dets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge consecutive Table elements on the same page in reading order.
+
+    A table run is clustered into one Table object if the items are adjacent
+    in page reading order, BUT clustering is blocked if the would-be merged
+    table bbox overlaps any Text or Title element on the same page.
+
+    Practical effect:
+      - Title / Text always break clustering
+      - Figure / Other / etc do not break clustering
+      - page boundaries always block clustering
+      - a table cluster is prevented from expanding across regions occupied by
+        Text or Title elements
+
+    Mutates `dets` in place and also returns it.
+    """
+
+    def _etype(d: Dict[str, Any]) -> str:
+        return str(d.get("element_type") or "").strip().lower()
+
+    def boxes_overlap(
+        b1: Tuple[float, float, float, float],
+        b2: Tuple[float, float, float, float],
+    ) -> bool:
+        x1a, y1a, x2a, y2a = b1
+        x1b, y1b, x2b, y2b = b2
+        return not (x2a < x1b or x2b < x1a or y2a < y1b or y2b < y1a)
+
+    def merged_bbox(cluster: List[Dict[str, Any]]) -> Optional[Tuple[float, float, float, float]]:
+        boxes = [d["bbox_xyxy"] for d in cluster if d.get("bbox_xyxy") is not None]
+        if not boxes:
+            return None
+
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+        return (x1, y1, x2, y2)
+
+    def merge_cluster(cluster: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if len(cluster) == 1:
+            return cluster[0]
+
+        cluster_sorted = _sort_page_dets_reading_order(cluster)
+        bbox = merged_bbox(cluster_sorted)
+
+        if bbox is None:
+            return cluster_sorted[0]
+
+        merged_text = "\n\n".join(
+            txt
+            for txt in (
+                (d.get("raw_text") or "").strip()
+                for d in cluster_sorted
+            )
+            if txt
+        ).strip() or None
+
+        first = cluster_sorted[0]
+
+        merged = dict(first)
+        merged.update({
+            "element_id": first["element_id"],
+            "element_type": "Table",
+            "raw_category": first.get("raw_category"),
+            "raw_text": merged_text,
+            "page": first["page"],
+            "bbox_xyxy": bbox,
+        })
+        return merged
+
+    pages, no_bbox_items = _group_dets_by_page(dets)
+    new_dets: List[Dict[str, Any]] = []
+
+    for page in sorted(pages.keys()):
+        page_items = _sort_page_dets_reading_order(pages[page])
+
+        blocker_boxes = [
+            d["bbox_xyxy"]
+            for d in page_items
+            if _etype(d) in {"text", "title"} and d.get("bbox_xyxy") is not None
+        ]
+
+        page_out: List[Dict[str, Any]] = []
+        table_cluster: List[Dict[str, Any]] = []
+
+        def flush_cluster():
+            nonlocal table_cluster
+            if not table_cluster:
+                return
+            page_out.append(merge_cluster(table_cluster))
+            table_cluster = []
+
+        for d in page_items:
+            et = _etype(d)
+
+            if et == "table":
+                if not table_cluster:
+                    table_cluster.append(d)
+                else:
+                    candidate_cluster = table_cluster + [d]
+                    candidate_bbox = merged_bbox(candidate_cluster)
+
+                    overlaps_blocker = (
+                        candidate_bbox is not None
+                        and any(boxes_overlap(candidate_bbox, bb) for bb in blocker_boxes)
+                    )
+
+                    if overlaps_blocker:
+                        flush_cluster()
+                        table_cluster.append(d)
+                    else:
+                        table_cluster.append(d)
+
+            elif et in {"title", "text"}:
+                flush_cluster()
+                page_out.append(d)
+
+            else:
+                # Figure / Other / etc do not break the table run
+                continue
+
+        flush_cluster()
+        new_dets.extend(_sort_page_dets_reading_order(page_out))
+
+    new_dets.extend(no_bbox_items)
+    dets[:] = _sort_global_dets(new_dets)
+    return dets
+
+def run_det_postprocessing(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    pipeline = [
+        _normalize_element_types,
+        lambda xs: _cluster_parallel_title_neighbors(xs, y_tolerance=0.0),
+        lambda xs: _cluster_parallel_text_neighbors(xs, y_tolerance=0.2),
+        lambda xs: _merge_titles_into_overlapping_text(xs, y_tolerance=0.0),
+        lambda xs: _merge_titles_into_overlapping_tables(xs, y_tolerance=0.0),
+        _cluster_consecutive_text_blocks,
+        _cluster_consecutive_table_blocks,
+        lambda xs: _cluster_other_detections(xs, breaker_types={"Text", "Table"}),
+        _map_nearest_preceding_title,
+    ]
+
+    for fn in pipeline:
+        dets = fn(dets)
+
+    dets[:] = _sort_global_dets(dets)
+    return dets
+    
+# 3) Partition pages creating raw cache[*]["elements"]
+
+def partition_one_image_raw(img_path: str) -> Dict[str, Any]:
+    """
+    Run partition_image and only store raw per-page data at this stage.
+    """
+    elements = partition_image(
+        filename=str(img_path),
+        strategy=STRATEGY,
+        hi_res_model_name=HI_RES_MODEL_NAME,
+        infer_table_structure=INFER_TABLE_STRUCTURE,
+        languages=LANGUAGES,
+        include_page_breaks=False,
+    )
+
+    return {
+        "img_path": img_path,
+        "pil_img": Image.open(img_path).convert("RGB"),
+        "elements": elements,
+        "detections": [],
+    }
+
+pages_to_process = image_paths[:MAX_PAGES_TO_PROCESS]
+
+cache = []
+for idx, img_path in enumerate(pages_to_process, start=1):
+    print(f"Partitioning page {idx}/{len(pages_to_process)}: {img_path}")
+    cache.append(partition_one_image_raw(img_path))
+
+print(f"\n✅ Cached raw Unstructured elements for {len(cache)} page(s).")
+
+
+
+# 4) Build minimal raw dets WITHOUT clustering or remapping
+
+dets: List[Dict[str, Any]] = []
+el_count = 0
+
+doc_name_for_id = os.path.basename(globals().get("DOC_PATH", "document"))
+doc_key = hashlib.sha1(doc_name_for_id.encode("utf-8")).hexdigest()[:12]
+
+for page_idx, item in enumerate(cache, start=1):
+    page_dets: List[Dict[str, Any]] = []
+    elements = item.get("elements", []) or []
+
+    for el in elements:
+        el_count += 1
+
+        raw_category = getattr(el, "category", None) or "Unknown"
+        raw_text = (getattr(el, "text", "") or "").strip() or None
+
+        md = getattr(el, "metadata", None)
+        coords = getattr(md, "coordinates", None) if md is not None else None
+        bbox_xyxy = coords_to_xyxy(coords)
+
+        # skip elements without coordinates
+        if bbox_xyxy is None:
+            continue
+
+        el_id = f"{doc_key}_p{page_idx:04d}_e{el_count:06d}"
+
+        # IMPORTANT:
+        # No remapping here. No clustering here.
+        # Store raw category and keep element_type raw for now.
+        det_dic = {
+            "element_id": el_id,
+            "element_type": str(raw_category).strip(),
+            "raw_category": str(raw_category).strip(),
+            "element_title": None,
+            "raw_text": raw_text,
+            "page": page_idx,
+            "bbox_xyxy": bbox_xyxy,
+            "image": None,
+        }
+
+        page_dets.append(det_dic)
+
+    # store RAW minimal detections back into cache
+    item["detections"] = page_dets
+
+# rebuild global flattened raw dets from cache
+dets = []
+for item in cache:
+    dets.extend(item["detections"])
+
+dets = _sort_global_dets(dets)
+
+print(f"✅ Built raw flattened detections list with {len(dets)} detection rows.")
+
+
+# 5) Run post-processing pipeline on global dets
+
+dets = run_det_postprocessing(dets)
+
+# Optional but useful:
+# sync processed detections back into cache page-by-page
+processed_by_page: Dict[int, List[Dict[str, Any]]] = {}
+for d in dets:
+    processed_by_page.setdefault(d["page"], []).append(d)
+
+for page_idx, item in enumerate(cache, start=1):
+    item["detections"] = processed_by_page.get(page_idx, [])
+
+
+# 6) Print out results
+
+category_counts = Counter()
+
+for d in dets:
+    category_counts.update([d["element_type"]])
+
+print("\n--- Element type counts (after post-processing) ---")
+for c, n in category_counts.most_common():
+    print(f"  {c:20s} {n}")
+
+print(f"\nTotal raw elements seen: {el_count}")
+print(f"Total final detections stored: {len(dets)}")
+# 3.1: interactive preview
+
+# ---- Preconditions
+if "cache" not in globals() or not cache:
+    raise RuntimeError("cache not found/empty. Run code cell #3 first.")
+
+# Colors keyed directly by element_type
+ELEMENT_COLORS = {
+    "Table": "tab:blue",
+    "Figure": "tab:orange",
+    "Text": "tab:green",
+    "Title": "tab:red",
+    "SectionHeader": "tab:purple",
+    "Section-header": "tab:purple",
+    "Section Header": "tab:purple",
+    "ListItem": "tab:brown",
+    "List-item": "tab:brown",
+    "Footer": "tab:gray",
+    "Other": "tab:gray",
+}
+
+# Collect available element types from cache, keep a sensible order first
+preferred_order = [
+    "Table",
+    "Figure",
+    "Text",
+    "Title",
+    "SectionHeader",
+    "Section-header",
+    "Section Header",
+    "ListItem",
+    "List-item",
+    "Footer",
+    "Other",
+]
+
+found_types = []
+seen = set()
+for item in cache:
+    for d in item.get("detections", []):
+        t = d.get("element_type")
+        if t and t not in seen:
+            seen.add(t)
+            found_types.append(t)
+
+toggle_names = [t for t in preferred_order if t in seen] + sorted([t for t in found_types if t not in preferred_order])
+
+def draw_page(pil_img, detections: List[Dict[str, Any]], selected_types: set, title: str = ""):
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(pil_img)
+    ax.axis("off")
+    if title:
+        ax.set_title(title)
+
+    counts: Dict[str, int] = {}
+
+    for d in detections:
+        element_type = d["element_type"]
+        if element_type not in selected_types:
+            continue
+
+        counts[element_type] = counts.get(element_type, 0) + 1
+
+        x1, y1, x2, y2 = d["bbox_xyxy"]
+        w, h = x2 - x1, y2 - y1
+        color = ELEMENT_COLORS.get(element_type, "tab:gray")
+
+        rect = patches.Rectangle(
+            (x1, y1), w, h,
+            linewidth=2,
+            edgecolor=color,
+            facecolor="none"
+        )
+        ax.add_patch(rect)
+
+        label = f"{element_type}"
+        ax.text(
+            x1,
+            max(0, y1 - 5),
+            label,
+            fontsize=9,
+            bbox=dict(facecolor=color, alpha=0.25, edgecolor="none", pad=2),
+        )
+
+    legend_handles = [
+        patches.Patch(color=ELEMENT_COLORS.get(t, "tab:gray"), label=t)
+        for t in toggle_names
+    ]
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="lower right")
+
+    print("Detected (shown):", counts)
+    plt.show()
+
+# ---- Widgets
+page_slider = widgets.IntSlider(
+    value=1,
+    min=1,
+    max=len(cache),
+    step=1,
+    description="Page",
+    continuous_update=False
+)
+
+type_checks = {
+    name: widgets.Checkbox(value=True, description=name)
+    for name in toggle_names
+}
+
+checks_box = widgets.VBox(list(type_checks.values()))
+ui = widgets.HBox([page_slider, checks_box])
+out = widgets.Output()
+
+def render(*_):
+    with out:
+        clear_output(wait=True)
+        page_idx = page_slider.value - 1
+        selected = {k for k, w in type_checks.items() if w.value}
+        item = cache[page_idx]
+
+        title = (
+            f"Unstructured partition_image — page {page_slider.value}/{len(cache)} • "
+            f"{os.path.basename(item['img_path'])}"
+        )
+
+        draw_page(
+            item["pil_img"],
+            item["detections"],
+            selected_types=selected,
+            title=title,
+        )
+
+page_slider.observe(render, names="value")
+for w in type_checks.values():
+    w.observe(render, names="value")
+
+display(ui, out)
+render()
+# 3.2: Crop images directly into dets[i]["image"]
+
+# ---- Config
+PAD = 6
+
+# ---- Preconditions
+if "dets" not in globals() or not dets:
+    raise RuntimeError("`dets` not found/empty. Run code cell #3 first.")
+
+if "image_paths" not in globals() or not image_paths:
+    raise RuntimeError("`image_paths` not found/empty. Run the PDF->PNG cell first.")
+
+from typing import Dict, Any
+from PIL import Image
+import matplotlib.pyplot as plt
+
+def _clip_box(x1, y1, x2, y2, W, H, pad=0):
+    x1 = max(0, int(x1) - pad)
+    y1 = max(0, int(y1) - pad)
+    x2 = min(W, int(x2) + pad)
+    y2 = min(H, int(y2) + pad)
+    return x1, y1, x2, y2
+
+# Cache opened page images so each page PNG is only loaded once
+page_image_cache: Dict[int, Image.Image] = {}
+
+cropped_count = 0
+skipped_count = 0
+
+for d in dets:
+    # Reset image field by default
+    d["image"] = None
+
+    element_type = str(d.get("element_type") or "").strip().lower()
+    if element_type not in {"text", "table"}:
+        continue
+
+    page_idx = d.get("page")
+    bbox = d.get("bbox_xyxy")
+
+    if page_idx is None or bbox is None:
+        skipped_count += 1
+        continue
+
+    page_idx = int(page_idx)
+
+    if page_idx < 1 or page_idx > len(image_paths):
+        skipped_count += 1
+        continue
+
+    # Load page image once
+    if page_idx not in page_image_cache:
+        page_img = Image.open(image_paths[page_idx - 1]).convert("RGB")
+        page_image_cache[page_idx] = page_img
+
+    page_img = page_image_cache[page_idx]
+    W, H = page_img.size
+
+    x1, y1, x2, y2 = bbox
+    cx1, cy1, cx2, cy2 = _clip_box(x1, y1, x2, y2, W, H, pad=PAD)
+
+    if cx2 <= cx1 or cy2 <= cy1:
+        skipped_count += 1
+        continue
+
+    cropped = page_img.crop((cx1, cy1, cx2, cy2)).copy()
+
+    # Store cropped image directly in the dets element dictionary
+    d["image"] = cropped
+
+    cropped_count += 1
+
+print(f"✅ Stored cropped images in dets['image'] for {cropped_count} Text/Table elements")
+print(f"⚠️ Skipped {skipped_count} elements due to missing/invalid page or bbox")
+
+# Optional: preview the first stored Table and Text image
+def _show_first_from_dets(target_type: str, title: str):
+    target_type = target_type.strip().lower()
+    for d in dets:
+        d = dets[18]
+        if str(d.get("element_type") or "").strip().lower() == target_type and d.get("image") is not None:
+            plt.figure(figsize=(7, 5))
+            plt.imshow(d["image"])
+            plt.axis("off")
+            plt.title(title)
+            plt.show()
+            return
+    print(f"{title}: none")
+
+_show_first_from_dets("table", "First Table crop from dets")
+_show_first_from_dets("text", "First Text crop from dets")
+# 4.1 General JSON writer for any dets[] element_type
+# Example:
+#   json_list = write_json_for_element("table")
+#   json_list = write_json_for_element("text")
+
+# Preconditions
+if "dets" not in globals() or not dets:
+    raise RuntimeError("`dets` not found/empty. Run cell #3 first.")
+if "OUT_PATH" not in globals() or not OUT_PATH:
+    raise RuntimeError("OUT_PATH not found.")
+
+# Databricks context
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+api_token = ctx.apiToken().get()
+
+headers = {
+    "Authorization": f"Bearer {api_token}",
+    "Content-Type": "application/json"
+}
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _element_sort_key(d):
+    bbox = d.get("bbox_xyxy")
+    return (
+        int(d.get("page", 0)),
+        bbox[1] if bbox is not None else float("inf"),
+        bbox[0] if bbox is not None else float("inf"),
+    )
+
+def _try_parse_json(s: str):
+    s = (s or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    return json.loads(s)
+
+def _extract_message_text(result):
+    if not isinstance(result, dict) or not result.get("choices"):
+        return json.dumps(result, ensure_ascii=False)
+
+    content = result["choices"][0]["message"].get("content")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+
+    return json.dumps(result, ensure_ascii=False)
+
+def _prompt_for_element(element_cat: str) -> str:
+    """
+    You can customize prompts per element type here.
+    """
+    cat = str(element_cat or "").strip().lower()
+
+    if cat == "table":
+        return (
+            "extract the information in this image as a json object, "
+            "only return the json object as text, no markdown"
+        )
+    elif cat == "text":
+        return (
+            "extract the information in this image as a json object, "
+            "only return the json object as text, no markdown"
+        )
+    else:
+        return (
+            f'extract the information in this "{cat}" image region as a json object, '
+            "only return the json object as text, no markdown"
+        )
+
+# ---------------------------
+# Main function
+# ---------------------------
+
+def write_json_for_element(element_cat: str):
+    element_cat = str(element_cat or "").strip().lower()
+    if not element_cat:
+        raise ValueError("element_cat must be a non-empty string.")
+
+    prompt = _prompt_for_element(element_cat)
+
+    # Match dets[] on element_type and require image
+    matched_dets = sorted(
+        [
+            d for d in dets
+            if str(d.get("element_type") or "").strip().lower() == element_cat
+            and d.get("image") is not None
+        ],
+        key=_element_sort_key,
+    )
+
+    if not matched_dets:
+        print(f'❌ No elements found for element_type="{element_cat}" with non-empty image.')
+        return []
+
+    json_list = []
+    output_rows = []
+
+    total = len(matched_dets)
+
+    for i, det in enumerate(matched_dets, start=1):
+        try:
+            cropped = det["image"]
+
+            # Encode cropped PNG -> base64 data URL
+            buf = io.BytesIO()
+            cropped.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            data_url = f"data:image/png;base64,{img_b64}"
+
+            payload = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+                "temperature": 0.0,
+                "max_tokens": 4000,
+            }
+
+            resp = requests.post(invoke_url_JSON, headers=headers, json=payload, timeout=300)
+
+            element_id = det.get("element_id")
+            element_title = det.get("element_title")
+            page = det.get("page")
+
+            if resp.status_code != 200:
+                print(f'❌ {element_cat} {i}/{total} failed')
+                print("Status:", resp.status_code)
+                print("Response:", resp.text[:2000])
+
+                error_obj = {
+                    "_error_status": resp.status_code,
+                    "_error_response": resp.text[:5000],
+                }
+                json_list.append(error_obj)
+
+                output_rows.append({
+                    element_cat: i,
+                    "element_id": element_id,
+                    "element_title": element_title,
+                    "page": page,
+                    "json_text": error_obj,
+                })
+                continue
+
+            result = resp.json()
+            model_text = _extract_message_text(result)
+
+            # Try parse returned JSON text
+            try:
+                parsed = _try_parse_json(model_text)
+            except Exception:
+                parsed = {
+                    "_raw_model_output": model_text,
+                    "_full_response": result,
+                }
+
+            json_list.append(parsed)
+
+            output_rows.append({
+                element_cat: i,
+                "element_id": element_id,
+                "element_title": element_title,
+                "page": page,
+                "json_text": parsed,
+            })
+
+            print(f'✅ Extracted {element_cat} {i}/{total}')
+
+        except Exception as e:
+            print(f'❌ {element_cat} {i}/{total} crashed: {e}')
+
+            element_id = det.get("element_id")
+            element_title = det.get("element_title")
+            page = det.get("page")
+
+            error_obj = {"_exception": str(e)}
+            json_list.append(error_obj)
+
+            output_rows.append({
+                element_cat: i,
+                "element_id": element_id,
+                "element_title": element_title,
+                "page": page,
+                "json_text": error_obj,
+            })
+
+    # Save file
+    os.makedirs(OUT_PATH, exist_ok=True)
+    out_file = Path(OUT_PATH) / f"{element_cat}_json.json"
+    out_file.write_text(
+        json.dumps(output_rows, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    print(f"\nSaved -> {out_file}")
+    print(f"✅ Wrote {len(output_rows)} item(s) for element_type='{element_cat}'")
+
+    # Preview first 2
+    if output_rows:
+        print(json.dumps(output_rows[:2], ensure_ascii=False, indent=2))
+
+    return json_list
+
+# ---------------------------
+# Example call
+# ---------------------------
+
+# Change this to "text", "table", etc.
+# ELEMENT_CAT = "table"
+
+# json_list = write_json_for_element(ELEMENT_CAT)
+
+write_json_for_element("Table")
+write_json_for_element("Text")
+# 4.2 LLM JSON --> tables_summary
+
+# Preconditions
+if "OUT_PATH" not in globals():
+    raise RuntimeError("OUT_PATH not found. Run cell #4 first.")
+
+JSON_PATH = Path(OUT_PATH) / "table_json.json"
+if not JSON_PATH.exists():
+    raise FileNotFoundError(f"Missing JSON file: {JSON_PATH}")
+
+# Load the JSON we created in cell #4
+tables = json.loads(JSON_PATH.read_text(encoding="utf-8"))
+
+if not isinstance(tables, list):
+    raise ValueError("Expected TABLES_JSON.json to be a JSON array (list) of table objects.")
+
+# Build lookup: {table_id: element_title} from dets
+if "dets" not in globals() or not dets:
+    raise RuntimeError("`dets` not found. Run cell #3 first so table titles are available.")
+
+def _table_sort_key(d):
+    bbox = d.get("bbox_xyxy")
+    return (
+        d.get("page", 0),
+        bbox[1] if bbox is not None else float("inf"),
+        bbox[0] if bbox is not None else float("inf"),
+    )
+
+table_dets = [
+    d for d in dets
+    if str(d.get("element_type") or "").strip().lower() == "table"
+]
+table_dets = sorted(table_dets, key=_table_sort_key)
+
+titles_by_table = {}
+
+for i, table_obj in enumerate(tables, start=1):
+    table_id = table_obj.get("table", i)
+
+    if i - 1 < len(table_dets):
+        titles_by_table[table_id] = table_dets[i - 1].get("element_title")
+    else:
+        titles_by_table[table_id] = None
+
+# Databricks context (token for Model Serving)
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+api_token = ctx.apiToken().get()
+
+headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+
+def summarize_one_table(table_obj: dict) -> str:
+    table_id = table_obj.get("table", "unknown")
+
+    summary_prompt = (
+        "Du kommer att få JSON som har extraherats från en tabell i ett PDF-dokument.\n"
+    "Din uppgift är att skapa en sökoptimerad svensk textsammanfattning som ska användas för semantisk sökning i ett RAG-system.\n\n"
+
+    "Viktigt:\n"
+    "- Skriv faktatätt och konkret, inte pratigt.\n"
+    "- Bevara alla viktiga namn, parter, fastighetsbeteckningar, avtalsnummer, konton, datum, perioder, belopp, procenttal och enheter.\n"
+    "- Använd svenska nyckelord som en användare sannolikt söker på.\n"
+    "- Lägg gärna till vanliga synonymer eller alternativa sökord inom samma domän, men hitta inte på fakta.\n"
+    "- Om tabellen verkar höra till exempelvis hyresavtal, serviceavtal, leverantörsreskontra, saldobalans, balansräkning, resultatrapport, fastighetsskatt eller aviseringslista, skriv det uttryckligen.\n"
+    "- Om något är oklart på grund av OCR eller ofullständig JSON, skriv att informationen är oklar i stället för att gissa.\n"
+    "- Returnera endast ren text. Ingen markdown, inga punktlistetecken som '*', inga JSON-block.\n\n"
+
+    "Texten ska ha följande struktur:\n\n"
+
+    "Sökbeskrivning:\n"
+    "Beskriv med 2-4 meningar vad tabellen handlar om och vilket dokument- eller affärssammanhang den verkar tillhöra.\n\n"
+
+    "Viktig information:\n"
+    "Lista de viktigaste identifierbara uppgifterna som korta rader med etikett och värde. "
+    "Exempel: Hyresgäst: ..., Hyresvärd: ..., Fastighet: ..., Period: ..., Belopp: ..., Konto: ..., Avtalstid: ...\n\n"
+
+    "Sökord och synonymer:\n"
+    "Skriv en kompakt rad med relevanta söktermer, inklusive alternativa formuleringar. "
+    "Exempel: hyresavtal, lokalhyra, årshyra, hyresgäst, hyresvärd, avtalstid, uppsägningstid.\n\n"
+
+    "Frågor tabellen kan besvara:\n"
+    "Skriv 3-6 naturliga svenska frågor som en användare skulle kunna ställa och som denna tabell helt eller delvis kan besvara.\n\n"
+
+        f"Tabell-id: {table_id}\n"
+        f"Tabellrubrik eller närmaste titel: {titles_by_table.get(table_id) or '[saknas]'}\n"
+        "JSON:\n"
+        f"{json.dumps(table_obj, ensure_ascii=False)}"
+    )
+
+    payload = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": summary_prompt}]}],
+        "temperature": 0.0,
+        "max_tokens": 1200,
+    }
+
+    resp = requests.post(invoke_url_SUMMARY, headers=headers, json=payload, timeout=300)
+    resp.raise_for_status()
+    result = resp.json()
+
+    text_out = None
+    if isinstance(result, dict) and result.get("choices"):
+        text_out = result["choices"][0]["message"].get("content")
+
+    return (text_out or json.dumps(result, ensure_ascii=False)).strip()
+
+# 1)–3) Build cache dict: {table_number: summary_text}
+summaries_by_table = {}
+
+for i, table_obj in enumerate(tables, start=1):
+    # Prefer the explicit "table" field, else fall back to list index
+    table_id = table_obj.get("table", i)
+
+    try:
+        summaries_by_table[table_id] = summarize_one_table(table_obj)
+    except Exception as e:
+        summaries_by_table[table_id] = f"[ERROR] Failed to summarize table {table_id}: {type(e).__name__}: {e}"
+
+# 4) Write all summaries to OUT_PATH/tables_summary.txt
+OUT_SUMMARY_PATH = Path(OUT_PATH) / "tables_summary.txt"
+
+# Sort keys in a stable way (numeric first when possible)
+def _sort_key(k):
+    try:
+        return (0, int(k))
+    except Exception:
+        return (1, str(k))
+
+with OUT_SUMMARY_PATH.open("w", encoding="utf-8") as f:
+    for table_id in sorted(summaries_by_table.keys(), key=_sort_key):
+        table_title = titles_by_table.get(table_id) or "[No title found]"
+
+        f.write(f"table {table_id}\n")
+        f.write(f"title: {table_title}\n")
+        f.write(summaries_by_table[table_id].rstrip() + "\n\n")
+
+print(f"Wrote {len(summaries_by_table)} table summaries to: {OUT_SUMMARY_PATH}")
+
+# 5) Delete the dictionary
+del summaries_by_table
+# 4.3 LLM compare two OCR versions of text elements --> text_summary.txt
+
+# ---------------------------
+# Preconditions
+# ---------------------------
+if "OUT_PATH" not in globals() or not OUT_PATH:
+    raise RuntimeError("OUT_PATH not found. Run previous cells first.")
+
+if "dets" not in globals() or not dets:
+    raise RuntimeError("`dets` not found/empty. Run cell #3 first.")
+
+TEXT_JSON_PATH = Path(OUT_PATH) / "text_json.json"
+if not TEXT_JSON_PATH.exists():
+    raise FileNotFoundError(f"Missing JSON file: {TEXT_JSON_PATH}")
+
+# ---------------------------
+# 1) Load text_json.json
+# ---------------------------
+texts = json.loads(TEXT_JSON_PATH.read_text(encoding="utf-8"))
+
+if not isinstance(texts, list):
+    raise ValueError("Expected text_json.json to be a JSON array (list) of text objects.")
+
+# Requested variable
+text_summaries = ""
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _extract_message_text(result):
+    """
+    Robustly extract returned text from Databricks chat response.
+    """
+    if not isinstance(result, dict) or not result.get("choices"):
+        return json.dumps(result, ensure_ascii=False)
+
+    content = result["choices"][0]["message"].get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+
+    return json.dumps(result, ensure_ascii=False)
+
+def _extract_text_from_json_text(json_text_value):
+    """
+    Extract a usable text string from the 'json_text' field in text_json.json.
+    Supports dict, string, or fallback JSON serialization.
+    """
+    if json_text_value is None:
+        return None
+
+    if isinstance(json_text_value, str):
+        return json_text_value.strip()
+
+    if isinstance(json_text_value, dict):
+        # Prefer common keys if present
+        for key in ["text_content", "text", "content", "raw_text"]:
+            val = json_text_value.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        # If model output was not parsed cleanly
+        if "_raw_model_output" in json_text_value:
+            val = json_text_value.get("_raw_model_output")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+        # Fallback: stringify dict
+        return json.dumps(json_text_value, ensure_ascii=False)
+
+    # list / other object types
+    return json.dumps(json_text_value, ensure_ascii=False)
+
+# Build lookup from dets: {element_id: raw_text}
+# Faster than scanning all dets for every element_id
+raw_text_by_element_id = {
+    str(d.get("element_id")): d.get("raw_text")
+    for d in dets
+    if d.get("element_id") is not None
+    and str(d.get("element_type") or "").strip().lower() == "text"
+}
+
+# ---------------------------
+# Databricks context
+# ---------------------------
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+api_token = ctx.apiToken().get()
+
+headers = {
+    "Authorization": f"Bearer {api_token}",
+    "Content-Type": "application/json"
+}
+
+# ---------------------------
+# 2) Iterate through text_json.json
+# ---------------------------
+success_count = 0
+error_count = 0
+processed_count = 0
+
+for obj in texts:
+    element_id = obj.get("element_id")
+    
+    if not element_id:
+        error_count += 1
+        text_summaries += "[ERROR] Missing element_id in text_json.json entry\n\n"
+        continue
+
+    # i) Fetch text from json_text row -> text_1
+    text_1 = _extract_text_from_json_text(obj.get("json_text"))
+
+    # ii) Find matching raw_text in dets -> text_2
+    text_2 = raw_text_by_element_id.get(str(element_id))
+    el_title = obj.get("element_title")
+
+    if not text_1 and not text_2:
+        error_count += 1
+        text_summaries += (
+            f"{element_id}\n"
+            "[ERROR] Neither json_text nor raw_text was available for this element.\n\n"
+        )
+        continue
+
+    summary_prompt = (
+            "Du kommer att få två versioner av samma textstycke från ett PDF-dokument:\n"
+            "1. En JSON-tolkad textversion som har extraherats från en bild av textstycket.\n"
+            "2. En rå OCR-text från dokumentets layoutanalys.\n\n"
+
+            "Din uppgift är att skapa en sökoptimerad svensk textsammanfattning för ett RAG-system och semantisk sökning.\n\n"
+
+            "Viktigt:\n"
+            "- Jämför båda textversionerna och använd den information som verkar mest korrekt.\n"
+            "- Bevara exakta namn, parter, bolag, kommuner, fastighetsbeteckningar, adresser, organisationsnummer, personnamn, datum, perioder, belopp, kontonummer, avtalsnummer, paragrafhänvisningar och andra identifierare.\n"
+            "- Skriv faktatätt, konkret och sökbart. Undvik en alltför muntlig eller allmän sammanfattning.\n"
+            "- Lägg till relevanta svenska sökord och vanliga alternativa formuleringar som användare kan tänkas söka på.\n"
+            "- Om stycket verkar tillhöra en viss dokumenttyp, skriv det uttryckligen, till exempel hyresavtal, tilläggsavtal, serviceavtal, nyttjanderättsavtal,       leverantörsreskontra, saldobalans, balansräkning, resultatrapport, fastighetsskatt, faktureringslista eller aviseringslista.\n"
+            "- Om OCR eller JSON verkar innehålla fel, skriv vad som är osäkert. Gissa inte.\n"
+            "- Returnera endast ren text. Ingen markdown, inga punktlistetecken som '*', inga JSON-block.\n\n"
+
+            "Texten ska ha följande struktur:\n\n"
+
+            "Sökbeskrivning:\n"
+            "Skriv 2-4 meningar som beskriver vad textstycket handlar om, vilket dokument- eller affärssammanhang det verkar tillhöra, och varför det kan vara relevant i due diligence eller fastighetsanalys.\n\n"
+
+            "Viktig information:\n"
+            "Lista de viktigaste uppgifterna som korta rader med etikett och värde. "
+            "Exempel: Part: ..., Fastighet: ..., Avtal: ..., Period: ..., Belopp: ..., Konto: ..., Villkor: ..., Risk/anmärkning: ...\n\n"
+
+            "Sökord och synonymer:\n"
+            "Skriv en kompakt rad med relevanta söktermer och alternativa formuleringar som kan hjälpa semantisk sökning.\n\n"
+
+            "Frågor textstycket kan besvara:\n"
+            "Skriv 3-6 naturliga svenska frågor som en användare skulle kunna ställa och som detta textstycke helt eller delvis kan besvara.\n\n"
+
+            "Osäkerheter:\n"
+            "Skriv kort om något verkar oklart, motsägelsefullt eller OCR-skadat. Om inget är oklart, skriv: Inga tydliga osäkerheter identifierade.\n\n"
+
+            f"Element-id: {element_id}\n"
+            f"Titel eller närmaste rubrik: {el_title or '[saknas]'}\n\n"
+            f"JSON-tolkad textversion:\n{text_1 or '[saknas]'}\n\n"
+            f"Rå OCR-text:\n{text_2 or '[saknas]'}"
+        )
+
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": summary_prompt}
+                ],
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1200,
+    }
+
+    try:
+        resp = requests.post(invoke_url_JSON, headers=headers, json=payload, timeout=300)
+        resp.raise_for_status()
+        result = resp.json()
+
+        summary_text = _extract_message_text(result)
+
+        # v) append output + id into text_summaries
+        text_summaries += (
+            f"Text {processed_count + 1}\n"
+            f"Element id: {element_id}\n"
+            f"{summary_text.rstrip()}\n\n"
+        )
+        processed_count += 1
+        success_count += 1
+        print(f"✅ Summarized text element: {element_id} {processed_count}")
+
+    except Exception as e:
+        error_count += 1
+        text_summaries += (
+            f"{element_id}\n"
+            f"[ERROR] Failed to summarize element: {type(e).__name__}: {e}\n\n"
+        )
+        print(f"❌ Failed for {element_id}: {type(e).__name__}: {e}")
+
+# ---------------------------
+# 3) Clear and write text_summary.txt
+# ---------------------------
+OUT_SUMMARY_PATH = Path(OUT_PATH) / "text_summary.txt"
+
+# Opening with "w" clears the file first, then writes new content
+OUT_SUMMARY_PATH.write_text(text_summaries, encoding="utf-8")
+
+# ---------------------------
+# 4) Print success or not
+# ---------------------------
+print("\n----------------------------------------")
+print(f"Finished writing text summaries to: {OUT_SUMMARY_PATH}")
+print(f"Processed successfully: {success_count}")
+print(f"Errors: {error_count}")
+print(f"Total attempted: {processed_count + error_count}")
+print("----------------------------------------")
+# 5.1 Write to DELTA TABLE from dets list only
+
+# Preconditions
+if "dets" not in globals() or not dets:
+    raise RuntimeError("`dets` is missing/empty. Run partitioning cell #3 first.")
+if "DOC_PATH" not in globals() or not DOC_PATH:
+    raise RuntimeError("`DOC_PATH` is missing. Set it in cell #1.3 first.")
+
+# Target table
+catalog = "dev"
+schema  = "acquisition_intelligence"
+table   = DELTA_TABLE
+table_fqn = f"{catalog}.{schema}.{table}"
+
+spark.sql(f"USE CATALOG `{catalog}`")
+spark.sql(f"USE SCHEMA `{schema}`")
+
+# 0) doc_id = basename(DOC_PATH)
+doc_id = os.path.basename(DOC_PATH)
+source_name = str(DOC_PATH)
+
+# ---------------------------
+# Ensure target Delta table has column: element_title
+# ---------------------------
+existing_cols = {
+    r.col_name
+    for r in spark.sql(f"DESCRIBE TABLE {table_fqn}").collect()
+    if r.col_name and not r.col_name.startswith("#")
+}
+
+if "element_title" not in existing_cols:
+    spark.sql(f"""
+        ALTER TABLE {table_fqn}
+        ADD COLUMNS (element_title STRING)
+    """)
+    print(f"Added missing column `element_title` to {table_fqn}.")
+
+# Output schema must match Delta table exactly
+out_schema = StructType([
+    StructField("doc_id",         StringType(),  nullable=False),
+    StructField("element_id",     StringType(),  nullable=False),
+    StructField("element_type",   StringType(),  nullable=False),
+    StructField("element_title",  StringType(),  nullable=True),
+    StructField("raw_text",       StringType(),  nullable=True),
+    StructField("raw_table",      StringType(),  nullable=True),
+    StructField("summary_text",   StringType(),  nullable=True),
+    StructField("page",           IntegerType(), nullable=False),
+    StructField("bbox_xyxy",      ArrayType(FloatType(), containsNull=False), nullable=True),
+    StructField("source_name",    StringType(),  nullable=False),
+])
+
+# 1) Create one row per item in dets
+# 1) Create one row per item in dets
+rows = []
+
+for d in dets:
+    element_id    = d["element_id"]
+    element_type  = str(d["element_type"])
+    element_title = d.get("element_title")
+    raw_text_in   = d.get("raw_text")
+    page          = int(d["page"])
+    bbox_xyxy     = d.get("bbox_xyxy")
+
+    et_lower = element_type.strip().lower()
+
+    # Only keep text and table
+    if et_lower not in {"text", "table"}:
+        continue
+
+    # normalize bbox to list[float] for Delta schema
+    if bbox_xyxy is not None:
+        bbox_xyxy = [float(x) for x in bbox_xyxy]
+
+    # 2) Map dict values to Delta columns
+    if et_lower == "table":
+        summary_text = None
+        raw_text_out = None
+    else:  # text
+        summary_text = None
+        raw_text_out = raw_text_in
+
+    rows.append((
+        doc_id,         # doc_id
+        element_id,     # element_id
+        element_type,   # element_type
+        element_title,  # element_title
+        raw_text_out,   # raw_text
+        None,           # raw_table
+        summary_text,   # summary_text
+        page,           # page
+        bbox_xyxy,      # bbox_xyxy
+        source_name,    # source_name
+    ))
+
+df_chunks = spark.createDataFrame(rows, schema=out_schema)
+
+element_count = df_chunks.count()
+print(f"Prepared {element_count} rows for source={doc_id}.")
+display(df_chunks.limit(25))
+
+# ---------------------------
+# Write: MERGE (idempotent)
+# ---------------------------
+staging_view = "stg_doc_chunks"
+df_chunks.createOrReplaceTempView(staging_view)
+
+spark.sql(f"""
+MERGE INTO {table_fqn} AS t
+USING {staging_view} AS s
+ON  t.doc_id = s.doc_id
+AND t.element_id = s.element_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+""")
+
+print(f"✅ Successfully added {element_count} elements into {table_fqn}.")
+# 5.2 Enrich DELTA TABLE table rows with:
+#  - raw_table JSON from TABLES_JSON.json  -> DELTA TABLE.raw_table
+#  - per-table summaries from tables_summary.txt -> DELTA TABLE.summary_text
+# Prefer matching by element_id when available; otherwise fall back to sequential mapping.
+
+# Preconditions
+if "DOC_PATH" not in globals() or not DOC_PATH:
+    raise RuntimeError("DOC_PATH not found.")
+if "OUT_PATH" not in globals() or not OUT_PATH:
+    raise RuntimeError("OUT_PATH not found.")
+
+catalog = "dev"
+schema  = "acquisition_intelligence"
+table   = DELTA_TABLE
+table_fqn = f"{catalog}.{schema}.{table}"
+
+spark.sql(f"USE CATALOG `{catalog}`")
+spark.sql(f"USE SCHEMA `{schema}`")
+
+doc_id = os.path.basename(DOC_PATH).replace("'", "''")
+
+# ============================================================
+# 1) Load TABLES_JSON.json
+# ============================================================
+JSON_PATH = Path(OUT_PATH) / "table_json.json"
+if not JSON_PATH.exists():
+    JSON_PATH = Path("/mnt/data/table_json.json")
+
+if not JSON_PATH.exists():
+    raise FileNotFoundError(
+        f"Missing TABLES_JSON.json at {Path(OUT_PATH) / 'TABLES_JSON.json'} or /mnt/data/TABLES_JSON.json"
+    )
+
+tables_payload = json.loads(JSON_PATH.read_text(encoding="utf-8"))
+if not isinstance(tables_payload, list):
+    raise ValueError("Expected TABLES_JSON.json to be a JSON array (list) of table objects.")
+
+# Build cache:
+#   by_element_id -> raw_table json text
+#   by_table_idx  -> raw_table json text
+table_json_by_element_id = {}
+table_json_by_index = {}
+
+for obj in tables_payload:
+    if not isinstance(obj, dict):
+        continue
+
+    table_idx = obj.get("table")
+    element_id = obj.get("element_id")
+
+    payload = dict(obj)
+    payload.pop("table", None)
+
+    raw_table_json = json.dumps(payload, ensure_ascii=False)
+
+    if element_id:
+        table_json_by_element_id[str(element_id)] = raw_table_json
+
+    if table_idx is not None:
+        try:
+            table_json_by_index[int(table_idx)] = raw_table_json
+        except Exception:
+            pass
+
+if not table_json_by_element_id and not table_json_by_index:
+    raise ValueError("Could not build any usable table JSON mapping from TABLES_JSON.json")
+
+# ============================================================
+# 2) Load tables_summary.txt
+# ============================================================
+SUMMARY_PATH = Path(OUT_PATH) / "tables_summary.txt"
+if not SUMMARY_PATH.exists():
+    SUMMARY_PATH = Path("/mnt/data/tables_summary.txt")
+
+if not SUMMARY_PATH.exists():
+    raise FileNotFoundError(
+        f"Missing tables_summary.txt at {Path(OUT_PATH) / 'tables_summary.txt'} or /mnt/data/tables_summary.txt"
+    )
+
+summary_text_all = SUMMARY_PATH.read_text(encoding="utf-8")
+
+def parse_tables_summary_txt(text: str) -> dict:
+    """
+    Parse a file formatted like:
+      table 1
+      <summary...>
+      table 2
+      <summary...>
+    Returns {1: "<summary...>", 2: "<summary...>", ...}
+    """
+    lines = text.splitlines()
+    out = {}
+    cur_idx = None
+    buf = []
+
+    header_re = re.compile(r"^\s*table\s+(\d+)\s*$", re.IGNORECASE)
+
+    def flush():
+        nonlocal cur_idx, buf
+        if cur_idx is not None:
+            out[cur_idx] = "\n".join(buf).strip() or None
+        buf = []
+
+    for ln in lines:
+        m = header_re.match(ln)
+        if m:
+            flush()
+            cur_idx = int(m.group(1))
+            continue
+
+        if cur_idx is not None and re.match(r"^\s*-{3,}\s*$", ln):
+            continue
+
+        if cur_idx is not None:
+            buf.append(ln)
+
+    flush()
+    return out
+
+table_summary_by_index = parse_tables_summary_txt(summary_text_all)
+
+if not table_summary_by_index:
+    raise ValueError("Could not parse any 'table i' sections from tables_summary.txt")
+
+# ============================================================
+# 2B) Load text_summary.txt / text_summaries.txt
+#     and parse summaries by element_id
+# ============================================================
+TEXT_SUMMARY_PATH = Path(OUT_PATH) / "text_summary.txt"
+
+if not TEXT_SUMMARY_PATH.exists():
+    alt_path = Path(OUT_PATH) / "text_summaries.txt"
+    if alt_path.exists():
+        TEXT_SUMMARY_PATH = alt_path
+
+if not TEXT_SUMMARY_PATH.exists():
+    for alt_path in [Path("/mnt/data/text_summary.txt"), Path("/mnt/data/text_summaries.txt")]:
+        if alt_path.exists():
+            TEXT_SUMMARY_PATH = alt_path
+            break
+
+text_summaries = None
+text_summary_by_element_id = {}
+
+def parse_text_summaries_txt(text: str) -> dict:
+    """
+    Supports blocks like:
+
+      Text 1
+      Element id: aac5c077c6c8_p0001_e000008
+      <summary...>
+
+      Text 2
+      Element id: aac5c077c6c8_p0001_e000009
+      <summary...>
+
+    Also supports older format:
+
+      aac5c077c6c8_p0001_e000008
+      <summary...>
+
+    Returns:
+      {element_id: summary_text, ...}
+    """
+    lines = text.splitlines()
+    out = {}
+    cur_id = None
+    buf = []
+
+    text_header_re = re.compile(r"^\s*text\s+\d+\s*$", re.IGNORECASE)
+    element_id_re  = re.compile(r"^\s*element\s+id\s*:\s*(\S+)\s*$", re.IGNORECASE)
+    plain_id_re    = re.compile(r"^\s*([A-Za-z0-9]+_p\d{4}_e\d{6})\s*$", re.IGNORECASE)
+
+    def flush():
+        nonlocal cur_id, buf
+        if cur_id is not None:
+            summary = "\n".join(buf).strip()
+            if summary:
+                out[cur_id] = summary
+        cur_id = None
+        buf = []
+
+    for ln in lines:
+        # New "Text i" block
+        if text_header_re.match(ln):
+            if cur_id is not None:
+                flush()
+            continue
+
+        # Explicit "Element id: ..."
+        m = element_id_re.match(ln)
+        if m:
+            if cur_id is not None:
+                flush()
+            cur_id = m.group(1).strip()
+            continue
+
+        # Older format: first line is just the element_id
+        m = plain_id_re.match(ln)
+        if m and cur_id is None:
+            cur_id = m.group(1).strip()
+            continue
+
+        if cur_id is not None:
+            buf.append(ln)
+
+    flush()
+    return out
+
+if TEXT_SUMMARY_PATH.exists():
+    text_summaries = TEXT_SUMMARY_PATH.read_text(encoding="utf-8")
+    text_summary_by_element_id = parse_text_summaries_txt(text_summaries)
+
+    print(f"Loaded text summaries from: {TEXT_SUMMARY_PATH}")
+    print(f"Parsed {len(text_summary_by_element_id)} text summary block(s).")
+else:
+    print("ℹ️ No text summary file found. Skipping text summary updates.")
+
+# ============================================================
+# 3) Pull Table rows for this document
+# ============================================================
+tables_df = spark.sql(f"""
+SELECT doc_id, element_id, element_type, page, bbox_xyxy, raw_text, source_name
+FROM {table_fqn}
+WHERE doc_id = '{doc_id}'
+  AND element_type = 'Table'
+""")
+
+table_count = tables_df.count()
+if table_count == 0:
+    raise ValueError(
+        f"No Table rows found in {table_fqn} for doc_id='{doc_id}'. "
+        f"Make sure cell 5.1 was run with the updated logic."
+    )
+
+print(f"Found {table_count} Table rows in {DELTA_TABLE} for doc_id='{doc_id}'.")
+
+# Deterministic sequential order for fallback matching
+w = Window.partitionBy("doc_id").orderBy(
+    F.col("page").asc(),
+    F.col("element_id").asc()
+)
+
+tables_ranked = (
+    tables_df
+    .withColumn("table_index", F.row_number().over(w))
+    .select("doc_id", "element_id", "table_index", "page", "bbox_xyxy", "raw_text")
+)
+
+print("Preview ranked table rows:")
+display(tables_ranked.orderBy("table_index").limit(50))
+
+# ============================================================
+# 4) Build JSON mapping tables
+# ============================================================
+
+# 4A) direct mapping by element_id
+json_by_element_rows = [(k, v) for k, v in sorted(table_json_by_element_id.items(), key=lambda kv: kv[0])]
+json_by_element_schema = StructType([
+    StructField("element_id", StringType(), False),
+    StructField("raw_table",  StringType(), True),
+])
+json_by_element_df = spark.createDataFrame(json_by_element_rows, schema=json_by_element_schema) if json_by_element_rows else None
+
+# 4B) fallback mapping by sequential table_index
+json_by_index_rows = [(int(k), v) for k, v in sorted(table_json_by_index.items(), key=lambda kv: kv[0])]
+json_by_index_schema = StructType([
+    StructField("table_index", IntegerType(), False),
+    StructField("raw_table",   StringType(), True),
+])
+json_by_index_df = spark.createDataFrame(json_by_index_rows, schema=json_by_index_schema) if json_by_index_rows else None
+
+summary_rows = [(int(k), v) for k, v in sorted(table_summary_by_index.items(), key=lambda kv: kv[0])]
+summary_schema = StructType([
+    StructField("table_index",  IntegerType(), False),
+    StructField("summary_text", StringType(), True),
+])
+summary_df = spark.createDataFrame(summary_rows, schema=summary_schema)
+
+# ============================================================
+# 5) Apply preferred matching:
+#    raw_table: by element_id if possible, else by table_index
+#    summary_text: by table_index
+# ============================================================
+updates = tables_ranked.alias("t")
+
+if json_by_element_df is not None:
+    updates = updates.join(
+        json_by_element_df.alias("je"),
+        on=F.col("t.element_id") == F.col("je.element_id"),
+        how="left"
+    )
+
+if json_by_index_df is not None:
+    updates = updates.join(
+        json_by_index_df.alias("ji"),
+        on="table_index",
+        how="left"
+    )
+
+updates = (
+    updates
+    .join(summary_df.alias("s"), on="table_index", how="left")
+    .select(
+        F.col("t.doc_id").alias("doc_id"),
+        F.col("t.element_id").alias("element_id"),
+        F.col("t.table_index").alias("table_index"),
+        F.col("t.page").alias("page"),
+        F.coalesce(
+            F.col("je.raw_table") if json_by_element_df is not None else F.lit(None),
+            F.col("ji.raw_table") if json_by_index_df is not None else F.lit(None)
+        ).alias("raw_table"),
+        F.col("s.summary_text").alias("summary_text"),
+    )
+)
+
+print("Preview mapping (top 50):")
+display(updates.orderBy("table_index").limit(50))
+
+# Diagnostics
+json_count_element = len(table_json_by_element_id)
+json_count_index = len(table_json_by_index)
+summary_count = len(table_summary_by_index)
+
+print(f"Table rows in DELTA TABLE: {table_count}")
+print(f"Tables in TABLES_JSON.json by element_id: {json_count_element}")
+print(f"Tables in TABLES_JSON.json by index: {json_count_index}")
+print(f"Tables in tables_summary.txt: {summary_count}")
+
+if table_count != summary_count:
+    print("⚠️ Warning: number of table rows and number of summaries do not match exactly.")
+
+# ============================================================
+# 6) De-duplicate source rows + MERGE
+# ============================================================
+dups = (
+    updates
+    .groupBy("doc_id", "element_id")
+    .count()
+    .where(F.col("count") > 1)
+)
+
+if dups.count() > 0:
+    print("Found duplicate (doc_id, element_id) rows in updates source. Showing a few:")
+    display(dups.orderBy(F.col("count").desc()).limit(50))
+
+w_dedup = Window.partitionBy("doc_id", "element_id").orderBy(F.col("table_index").asc())
+
+updates_dedup = (
+    updates
+    .withColumn("rn", F.row_number().over(w_dedup))
+    .where(F.col("rn") == 1)
+    .drop("rn")
+)
+
+updates_view = "stg_table_json_and_summary_updates_seq"
+updates_dedup.select("doc_id", "element_id", "raw_table", "summary_text").createOrReplaceTempView(updates_view)
+
+spark.sql(f"""
+MERGE INTO {table_fqn} AS t
+USING {updates_view} AS s
+ON  t.doc_id = s.doc_id
+AND t.element_id = s.element_id
+WHEN MATCHED THEN UPDATE SET
+  t.raw_table    = s.raw_table,
+  t.summary_text = s.summary_text
+""")
+
+updated_raw = updates_dedup.where(F.col("raw_table").isNotNull()).count()
+updated_sum = updates_dedup.where(F.col("summary_text").isNotNull()).count()
+print(f"✅ MERGE complete. Updated raw_table for {updated_raw} rows and summary_text for {updated_sum} rows.")
+
+# ============================================================
+# 6B) MERGE text summaries into summary_text for Text rows
+#     matching by element_id
+# ============================================================
+if text_summary_by_element_id:
+    doc_id_value = os.path.basename(DOC_PATH)
+
+    text_summary_rows = [
+        (doc_id_value, str(element_id), summary)
+        for element_id, summary in sorted(text_summary_by_element_id.items(), key=lambda kv: kv[0])
+        if summary is not None
+    ]
+
+    if text_summary_rows:
+        text_summary_schema = StructType([
+            StructField("doc_id",       StringType(), False),
+            StructField("element_id",   StringType(), False),
+            StructField("summary_text", StringType(), True),
+        ])
+
+        text_summary_updates_df = spark.createDataFrame(
+            text_summary_rows,
+            schema=text_summary_schema
+        )
+
+        print("Preview text summary mapping (top 50):")
+        display(text_summary_updates_df.orderBy("element_id").limit(50))
+
+        # Diagnostics: how many text rows in DELTA TABLE can be matched?
+        existing_text_rows_df = spark.sql(f"""
+        SELECT element_id, element_type
+        FROM {table_fqn}
+        WHERE doc_id = '{doc_id}'
+        """).dropDuplicates(["element_id"])
+
+        matched_text_count = (
+            text_summary_updates_df
+            .join(existing_text_rows_df, on="element_id", how="inner")
+            .count()
+        )
+
+        print(f"Text summary blocks parsed: {len(text_summary_rows)}")
+        print(f"Matching Text rows in DELTA TABLE for this doc: {matched_text_count}")
+
+        text_updates_view = "stg_text_summary_updates"
+        text_summary_updates_df.createOrReplaceTempView(text_updates_view)
+
+        spark.sql(f"""
+        MERGE INTO {table_fqn} AS t
+        USING {text_updates_view} AS s
+        ON  t.doc_id = s.doc_id
+        AND t.element_id = s.element_id
+        WHEN MATCHED THEN UPDATE SET
+        t.summary_text = s.summary_text
+        """)
+
+        print(f"✅ MERGE complete for text summaries. Updated up to {matched_text_count} text row(s).")
+    else:
+        print("ℹ️ text_summary_by_element_id was parsed but contained no non-empty summaries.")
+else:
+    print("ℹ️ No parsed text summaries found. Skipping text summary MERGE.")
+
+# ============================================================
+# 7) Clear temporary caches
+# ============================================================
+del table_json_by_element_id
+del table_json_by_index
+del table_summary_by_index
