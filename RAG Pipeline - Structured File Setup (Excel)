@@ -1,0 +1,1790 @@
+# 1 install
+%pip install "numpy==1.23.5" "pandas==1.5.3" "unstructured[xlsx]" "openpyxl>=3.1.0,<4.0.0" "langchain-text-splitters" "lxml" "xlsx2html"
+dbutils.library.restartPython()
+# 1.2 Imports
+
+import nltk
+import os, io, math, textwrap, re
+from collections import Counter, defaultdict, deque
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import ipywidgets as widgets
+import uuid
+import json
+import requests
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, range_boundaries
+
+from datetime import date, datetime, time
+from decimal import Decimal
+
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType
+)
+
+import unicodedata
+from collections import defaultdict, Counter
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.cell.cell import MergedCell
+from xlsx2html import xlsx2html
+from langchain_text_splitters import HTMLHeaderTextSplitter
+from unstructured.partition.xlsx import partition_xlsx
+from IPython.display import display, clear_output
+from unstructured.partition.text_type import (
+    is_bulleted_text,
+    is_possible_narrative_text,
+    is_possible_numbered_list,
+    is_possible_title,
+)
+nltk.download("punkt")
+# 1.3 Directories
+
+#resultatrapport
+excel_0 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.1 Resultatrapport/1.2.1 Resultarapport kontonivå 6 år.xlsx" #ResultatRapport
+# Andra
+excel_1 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.2 Mediaförbrukning/Rörströmsälven fjärrvärme förbrukning.xlsx" #EnergiFörbrukning
+excel_2 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/1.2.3.1 Förteckning drift-, service-, och leveransavtal/Avtalsspec.xlsx" #Avtal
+excel_3 = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/2.3.3 Resultat- och balansräkning/RR detaljerad ack 2020-09 Insikt.xlsx" #balansräkning
+
+#annan resultatrapporter
+excel_4 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/Valkeboskolan  Resultatrapport 2022-2025 (1).xlsx"  #ResultatRapport2
+excel_5 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/559136-8039 (2021) BoR.xlsx"
+excel_6 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/BOR 2021 882077.xlsx"
+excel_7 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/BR och RR 2022-04-30.xlsx"
+excel_8 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/Kaddetten RR BRF.xls"
+excel_9 = "/Volumes/dev/acquisition_intelligence/data_rooms/Resultatrapporter/Princeton - BR och RR 2018.xlsx"
+
+# Excel List
+document_list = []
+document_list.append(excel_0)
+document_list.append(excel_1)
+document_list.append(excel_2)
+document_list.append(excel_3)
+
+# DOC_PATH directory
+DOC_PATH = document_list[3]
+DELTA_TABLE = "rag_delta"
+OUT_PATH = "/Volumes/dev/acquisition_intelligence/data_rooms/Rörströmsälven 31/Testing_ocr_db/output/"
+# 2 Excel --> JSON
+
+# ---- Preconditions
+if "DOC_PATH" not in globals() or not DOC_PATH:
+    raise RuntimeError("DOC_PATH not found.")
+
+if not DOC_PATH.lower().endswith(".xlsx"):
+    raise RuntimeError(f"DOC_PATH does not point to an .xlsx file: {DOC_PATH}")
+
+# ---- Output containers
+# Keep variable name intact to minimize downstream changes
+json_sheets = []
+
+# ---- Read workbook sheet names
+# data_only=True keeps cached/calculated values instead of formulas
+wb = load_workbook(DOC_PATH, read_only=False, data_only=True)
+sheet_names = wb.sheetnames
+
+
+def _json_safe_value(value):
+    """
+    Convert Excel/openpyxl values to JSON-safe values.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    return str(value)
+
+
+def _safe_attr(obj, attr, default=None):
+    return getattr(obj, attr, default) if obj is not None else default
+
+
+def _color_rgb(color):
+    if color is None:
+        return None
+    return _json_safe_value(_safe_attr(color, "rgb"))
+
+
+def _font_to_dict(font):
+    if font is None:
+        return None
+
+    return {
+        "name": _json_safe_value(font.name),
+        "size": _json_safe_value(font.sz),
+        "bold": _json_safe_value(font.b),
+    }
+
+
+def _fill_to_dict(fill):
+    if fill is None:
+        return None
+
+    return {
+        "type": _json_safe_value(_safe_attr(fill, "fill_type")),
+        "rgb": _color_rgb(_safe_attr(fill, "fgColor")),
+    }
+
+
+def _side_style(side):
+    if side is None:
+        return None
+    return _json_safe_value(_safe_attr(side, "style") or _safe_attr(side, "border_style"))
+
+
+def _border_to_dict(border):
+    if border is None:
+        return None
+
+    return {
+        "left": _side_style(border.left),
+        "right": _side_style(border.right),
+        "top": _side_style(border.top),
+        "bottom": _side_style(border.bottom),
+    }
+
+
+def _alignment_to_dict(alignment):
+    if alignment is None:
+        return None
+
+    return {
+        "horizontal": _json_safe_value(alignment.horizontal),
+        "vertical": _json_safe_value(alignment.vertical),
+        "wrapText": _json_safe_value(_safe_attr(alignment, "wrapText")),
+    }
+
+
+def _style_to_dict(cell):
+    """
+    Minimal style summary.
+    """
+    return {
+        "style_id": _json_safe_value(_safe_attr(cell, "style_id")),
+        "number_format": _json_safe_value(_safe_attr(cell, "number_format")),
+    }
+
+
+def _row_dimension_to_dict(row_idx):
+    return {
+        "row_nr": row_idx,
+    }
+
+
+def _column_dimension_to_dict(col_idx):
+    return {
+        "column_nr": col_idx,
+        "column_letter": get_column_letter(col_idx),
+    }
+
+
+def _build_table_lookup(ws):
+    """
+    Returns:
+      sheet_header_row_counts: unique headerRowCount values found in sheet tables
+      table_lookup[(row, col)] = headerRowCount for cells inside a table
+    """
+    sheet_header_row_counts = []
+    table_lookup = {}
+
+    for _, tbl in ws.tables.items():
+        min_col, min_row, max_col, max_row = range_boundaries(tbl.ref)
+        header_row_count = _json_safe_value(getattr(tbl, "headerRowCount", None))
+
+        if header_row_count is not None and header_row_count not in sheet_header_row_counts:
+            sheet_header_row_counts.append(header_row_count)
+
+        for r in range(min_row, max_row + 1):
+            for c in range(min_col, max_col + 1):
+                table_lookup[(r, c)] = header_row_count
+
+    return sheet_header_row_counts, table_lookup
+
+
+def sheet_to_json_text(ws) -> str:
+    """
+    Convert one openpyxl worksheet into minimal enriched JSON text.
+
+    Structure:
+      - sheet
+      - rows
+      - columns
+      - cells
+    """
+    sheet_header_row_counts, table_lookup = _build_table_lookup(ws)
+
+    rows = [_row_dimension_to_dict(row_idx) for row_idx in range(1, ws.max_row + 1)]
+    columns = [_column_dimension_to_dict(col_idx) for col_idx in range(1, ws.max_column + 1)]
+
+    cells = []
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell_dict = {
+                "row": cell.row,
+                "column": cell.column,
+                "value": _json_safe_value(cell.value),
+                "data_type": _json_safe_value(_safe_attr(cell, "data_type")),
+                "font": _font_to_dict(_safe_attr(cell, "font")),
+                "fill": _fill_to_dict(_safe_attr(cell, "fill")),
+                "border": _border_to_dict(_safe_attr(cell, "border")),
+                "alignment": _alignment_to_dict(_safe_attr(cell, "alignment")),
+                "style": _style_to_dict(cell),
+                "headerRowCount": table_lookup.get((cell.row, cell.column)),
+            }
+            cells.append(cell_dict)
+
+    payload = {
+        "sheet": {
+            "sheet_name": ws.title,
+            "max_row": ws.max_row,
+            "max_column": ws.max_column,
+            "headerRowCount": sheet_header_row_counts if sheet_header_row_counts else None,
+        },
+        "rows": rows,
+        "columns": columns,
+        "cells": cells,
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+# ---- Convert each sheet to JSON and append to list
+for sheet_nr, sheet_name in enumerate(sheet_names, start=1):
+    ws = wb[sheet_name]
+
+    json_text = sheet_to_json_text(ws)
+
+    sheet_dict = {
+        "sheet_id": uuid.uuid4().hex,
+        "Sheet_name": sheet_name,
+        "JSON": json_text,
+        "sheet_nr": sheet_nr,
+    }
+
+    json_sheets.append(sheet_dict)
+
+wb.close()
+
+print(f"Workbook: {os.path.basename(DOC_PATH)}")
+print(f"Sheets converted: {len(json_sheets)}")
+
+for item in json_sheets:
+    print(
+        f"sheet_nr={item['sheet_nr']} | "
+        f"Sheet_name={item['Sheet_name']} | "
+        f"sheet_id={item['sheet_id']} | "
+        f"json_chars={len(item['JSON'])}"
+    )
+
+print(item['JSON'])
+# 2.1 Anatomy enrichment Excel JSON
+# Drop-in cell: kör direkt efter cellen "2 Excel --> JSON"
+
+ANATOMY_SCHEMA_VERSION = "sheet_table_regions_v1"
+MAX_EMPTY_ROW_GAP = 3
+MAX_EMPTY_COL_GAP = 3
+MIN_NON_EMPTY_CELLS_IN_ROW = 3
+
+def _safe_str(x: Any) -> str:
+    return "" if x is None else str(x)
+
+
+def _is_empty_value(x: Any) -> bool:
+    if x is None:
+        return True
+    if isinstance(x, str) and x.strip() == "":
+        return True
+    return False
+
+
+def _normalize_text(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[%€$£]", " ", s)
+    s = re.sub(r"[\(\)\[\]\{\}:;,_/\\|]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _tokens(x: Any) -> List[str]:
+    return [t for t in _normalize_text(x).split() if t]
+
+
+def _parse_number(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+
+    s = str(x).strip()
+    if not s:
+        return None
+
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+
+    s = s.replace("\u00a0", " ").replace(" ", "")
+    s = s.replace("%", "")
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or s in {"-", ".", ",", "-.", "-,"}:
+        return None
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if s.count(",") == 1 and len(s.split(",")[-1]) in {1, 2, 3}:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s and s.count(".") > 1:
+        s = s.replace(".", "")
+
+    try:
+        num = float(s)
+        return -num if negative else num
+    except Exception:
+        return None
+
+
+MONTH_WORDS = {
+    "januari", "februari", "mars", "april", "maj", "juni",
+    "juli", "augusti", "september", "oktober", "november", "december",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "okt", "nov", "dec"
+}
+MONTH_SET = {m.lower() for m in MONTH_WORDS}
+
+
+def _looks_like_year(x: Any) -> bool:
+    return bool(re.fullmatch(r"(19|20)\d{2}", _safe_str(x).strip()))
+
+
+def _looks_like_period(x: Any) -> bool:
+    s = _normalize_text(x)
+    return bool(
+        re.fullmatch(r"(19|20)\d{2}\s*-\s*(0?[1-9]|1[0-2])", s)
+        or s in MONTH_SET
+        or bool(re.fullmatch(r"(q[1-4]|kv[1-4])", s))
+    )
+
+
+def _is_text_like(x: Any) -> bool:
+    if _is_empty_value(x):
+        return False
+    return _parse_number(x) is None
+
+
+def _group_contiguous(nums: List[int], gap: int = 1) -> List[List[int]]:
+    nums = sorted(set(int(n) for n in nums))
+    if not nums:
+        return []
+
+    groups = [[nums[0]]]
+    for n in nums[1:]:
+        if n - groups[-1][-1] <= gap:
+            groups[-1].append(n)
+        else:
+            groups.append([n])
+    return groups
+
+
+def _compact_style_signals(cell: Dict[str, Any]) -> Dict[str, Any]:
+    font = cell.get("font") or {}
+    fill = cell.get("fill") or {}
+    border = cell.get("border") or {}
+    style = cell.get("style") or {}
+
+    border_count = sum(
+        1 for k in ("left", "right", "top", "bottom")
+        if border.get(k) not in (None, "", "none")
+    )
+
+    return {
+        "bold": bool(font.get("bold")),
+        "filled": fill.get("type") not in (None, "", "none"),
+        "border_count": border_count,
+        "number_format": style.get("number_format"),
+    }
+
+
+def _compact_cell(cell: Dict[str, Any]) -> Dict[str, Any]:
+    row = int(cell["row"])
+    col = int(cell["column"])
+    value = cell.get("value")
+
+    return {
+        "row": row,
+        "column": col,
+        "column_letter": get_column_letter(col),
+        "value": value,
+        "value_num": _parse_number(value),
+        "data_type": cell.get("data_type"),
+        "headerRowCount": cell.get("headerRowCount"),
+        "style_signals": _compact_style_signals(cell),
+    }
+
+
+def _build_sparse_sheet(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
+    sheet_meta = raw_payload.get("sheet", {}) or {}
+    cells_in = raw_payload.get("cells", []) or []
+
+    non_empty_cells = []
+    row_map = defaultdict(list)
+    col_map = defaultdict(list)
+
+    for cell in cells_in:
+        if _is_empty_value(cell.get("value")):
+            continue
+
+        c = _compact_cell(cell)
+        non_empty_cells.append(c)
+        row_map[c["row"]].append(c)
+        col_map[c["column"]].append(c)
+
+    for r in row_map:
+        row_map[r] = sorted(row_map[r], key=lambda x: x["column"])
+    for c in col_map:
+        col_map[c] = sorted(col_map[c], key=lambda x: x["row"])
+
+    return {
+        "sheet_meta": {
+            "sheet_name": sheet_meta.get("sheet_name"),
+            "max_row": int(sheet_meta.get("max_row") or 0),
+            "max_column": int(sheet_meta.get("max_column") or 0),
+            "headerRowCount": sheet_meta.get("headerRowCount"),
+        },
+        "cells": non_empty_cells,
+        "row_map": row_map,
+        "col_map": col_map,
+    }
+
+
+def _cells_within_bounds(cells: List[Dict[str, Any]], row_start: int, row_end: int, col_start: int, col_end: int) -> List[Dict[str, Any]]:
+    return [
+        c for c in cells
+        if row_start <= c["row"] <= row_end and col_start <= c["column"] <= col_end
+    ]
+
+
+def _row_cells_in_bounds(row_cells: List[Dict[str, Any]], col_start: int, col_end: int) -> List[Dict[str, Any]]:
+    return [c for c in row_cells if col_start <= c["column"] <= col_end]
+
+
+def _col_cells_in_bounds(col_cells: List[Dict[str, Any]], row_start: int, row_end: int) -> List[Dict[str, Any]]:
+    return [c for c in col_cells if row_start <= c["row"] <= row_end]
+
+
+def _band_stats(cells: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = sorted({c["row"] for c in cells})
+    cols = sorted({c["column"] for c in cells})
+
+    row_counts = Counter(c["row"] for c in cells)
+    col_counts = Counter(c["column"] for c in cells)
+
+    numeric_count = sum(c["value_num"] is not None for c in cells)
+    text_count = len(cells) - numeric_count
+
+    row_density_values = list(row_counts.values())
+    mean_row_density = sum(row_density_values) / max(len(row_density_values), 1)
+
+    return {
+        "row_count": len(rows),
+        "col_count": len(cols),
+        "rows": rows,
+        "cols": cols,
+        "numeric_count": numeric_count,
+        "text_count": text_count,
+        "numeric_ratio": numeric_count / max(len(cells), 1),
+        "rows_with_2plus": sum(v >= 2 for v in row_counts.values()),
+        "rows_with_3plus": sum(v >= 3 for v in row_counts.values()),
+        "cols_with_2plus": sum(v >= 2 for v in col_counts.values()),
+        "mean_row_density": mean_row_density,
+    }
+
+
+def _score_header_row(
+    row_nr: int,
+    rows_sorted: List[int],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    col_start: int,
+    col_end: int,
+) -> float:
+    row_cells = _row_cells_in_bounds(row_map.get(row_nr, []), col_start, col_end)
+    if not row_cells:
+        return 0.0
+
+    non_empty = len(row_cells)
+    year_cells = sum(_looks_like_year(c["value"]) for c in row_cells)
+    period_cells = sum(_looks_like_period(c["value"]) for c in row_cells)
+    numeric_cells = sum(c["value_num"] is not None for c in row_cells)
+    text_cells = non_empty - numeric_cells
+
+    bold_count = sum(bool((c.get("style_signals") or {}).get("bold")) for c in row_cells)
+    filled_count = sum(bool((c.get("style_signals") or {}).get("filled")) for c in row_cells)
+    border_count = sum(int((c.get("style_signals") or {}).get("border_count") or 0) > 0 for c in row_cells)
+
+    header_hint = any(c.get("headerRowCount") not in (None, 0, "0") for c in row_cells)
+
+    next_rows_numeric = 0
+    row_pos = rows_sorted.index(row_nr)
+    for next_row in rows_sorted[row_pos + 1: row_pos + 4]:
+        next_cells = _row_cells_in_bounds(row_map.get(next_row, []), col_start, col_end)
+        next_rows_numeric += sum(c["value_num"] is not None for c in next_cells)
+
+    score = 0.0
+    score += 0.5 if year_cells >= 2 else 0.0
+    score += 0.5 if period_cells >= 2 else 0.0
+    score += min(non_empty, 10) * 0.18
+    score += min(text_cells, 10) * 0.12
+    score -= min(numeric_cells, 10) * 0.08
+    score += min(next_rows_numeric, 12) * 0.12
+    score += bold_count * 1.5
+    score += filled_count * 1.5
+    score += border_count * 1.5
+
+    if numeric_cells == 0:
+        score += 0.35
+    if text_cells >= 2 and next_rows_numeric >= 2:
+        score += 1.10
+    if row_cells and _parse_number(row_cells[0]["value"]) is None:
+        score += 0.20
+    if header_hint:
+        score += 1.25
+
+    return score
+
+
+def _find_best_header_row(
+    rows_sorted: List[int],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    col_start: int,
+    col_end: int,
+    scan_limit: int = 8,
+) -> Tuple[Optional[int], float]:
+    candidate_rows = rows_sorted[:scan_limit]
+    best_row = None
+    best_score = 0.0
+
+    for row_nr in candidate_rows:
+        score = _score_header_row(
+            row_nr=row_nr,
+            rows_sorted=rows_sorted,
+            row_map=row_map,
+            col_start=col_start,
+            col_end=col_end,
+        )
+        if score > best_score:
+            best_row = row_nr
+            best_score = score
+
+    if best_score < 1.4:
+        return None, best_score
+
+    return best_row, best_score
+
+
+def _score_header_col(
+    col_nr: int,
+    cols_sorted: List[int],
+    col_map: Dict[int, List[Dict[str, Any]]],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    row_start: int,
+    row_end: int,
+) -> float:
+    col_cells = _col_cells_in_bounds(col_map.get(col_nr, []), row_start, row_end)
+    if len(col_cells) < 2:
+        return 0.0
+
+    text_rows = sum(_is_text_like(c["value"]) for c in col_cells)
+    numeric_rows = sum(c["value_num"] is not None for c in col_cells)
+    bold_count = sum(bool((c.get("style_signals") or {}).get("bold")) for c in col_cells)
+
+    right_side_numeric_rows = 0
+    for c in col_cells:
+        row_cells = row_map.get(c["row"], [])
+        right_side = [x for x in row_cells if x["column"] != col_nr and x["column"] > col_nr]
+        if any(x["value_num"] is not None for x in right_side):
+            right_side_numeric_rows += 1
+
+    unique_ratio = len({_normalize_text(c["value"]) for c in col_cells}) / max(len(col_cells), 1)
+    text_ratio = text_rows / max(len(col_cells), 1)
+    numeric_ratio = numeric_rows / max(len(col_cells), 1)
+
+    score = 0.0
+    score += len(col_cells) * 0.08
+    score += unique_ratio * 1.40
+    score += text_ratio * 1.20
+    score -= numeric_ratio * 1.15
+    score += right_side_numeric_rows * 0.12
+    score += bold_count * 1.2
+
+    if cols_sorted and col_nr == cols_sorted[0]:
+        score += 0.40
+    elif len(cols_sorted) > 1 and col_nr == cols_sorted[1]:
+        score += 0.20
+
+    return score
+
+
+def _find_best_header_col(
+    cols_sorted: List[int],
+    col_map: Dict[int, List[Dict[str, Any]]],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    row_start: int,
+    row_end: int,
+    scan_limit: int = 5,
+) -> Tuple[Optional[int], float]:
+    candidate_cols = cols_sorted[:scan_limit]
+    best_col = None
+    best_score = 0.0
+
+    for col_nr in candidate_cols:
+        score = _score_header_col(
+            col_nr=col_nr,
+            cols_sorted=cols_sorted,
+            col_map=col_map,
+            row_map=row_map,
+            row_start=row_start,
+            row_end=row_end,
+        )
+        if score > best_score:
+            best_col = col_nr
+            best_score = score
+
+    if best_score < 0.9:
+        return None, best_score
+
+    return best_col, best_score
+
+
+def _table_candidate_score(
+    cells: List[Dict[str, Any]],
+    header_row_score: float,
+    header_col_score: float,
+) -> float:
+    stats = _band_stats(cells)
+
+    score = 0.0
+    if stats["row_count"] >= 3:
+        score += 1.50
+    if stats["col_count"] >= 2:
+        score += 0.80
+    if stats["col_count"] >= 3:
+        score += 0.60
+
+    score += 0.80 if stats["rows_with_2plus"] >= 2 else 0.0
+    score += 0.60 if stats["rows_with_3plus"] >= 2 else 0.0
+    score += 0.50 if stats["cols_with_2plus"] >= 2 else 0.0
+
+    if 0.05 <= stats["numeric_ratio"] <= 0.95:
+        score += 0.80
+    if 0.15 <= stats["numeric_ratio"] <= 0.85:
+        score += 0.40
+
+    if stats["mean_row_density"] >= 2.0:
+        score += 0.50
+
+    score += min(header_row_score, 4.0) * 0.35
+    score += min(header_col_score, 3.0) * 0.25
+
+    return score
+
+
+def _extract_context_block(cells: List[Dict[str, Any]], block_id: str) -> Dict[str, Any]:
+    row_map = defaultdict(list)
+    for c in cells:
+        row_map[c["row"]].append(c)
+
+    lines = []
+    for row_nr in sorted(row_map.keys()):
+        parts = [_safe_str(c["value"]).strip() for c in sorted(row_map[row_nr], key=lambda x: x["column"])]
+        parts = [p for p in parts if p]
+        if parts:
+            lines.append({
+                "row_nr": row_nr,
+                "text": " | ".join(parts),
+            })
+
+    all_text = " ".join(line["text"] for line in lines).strip()
+    normalized_terms = sorted({
+        _normalize_text(tok)
+        for tok in re.split(r"\s+", all_text)
+        if _normalize_text(tok)
+    })
+
+    return {
+        "block_id": block_id,
+        "region_type": "context_block",
+        "bounds": {
+            "row_start": min(c["row"] for c in cells),
+            "row_end": max(c["row"] for c in cells),
+            "col_start": min(c["column"] for c in cells),
+            "col_end": max(c["column"] for c in cells),
+        },
+        "text_lines": lines,
+        "normalized_terms": normalized_terms[:200],
+    }
+
+
+def _row_label_candidates(row_cells: List[Dict[str, Any]], header_col: Optional[int]) -> List[str]:
+    row_cells = sorted(row_cells, key=lambda x: x["column"])
+
+    candidates = []
+
+    if header_col is not None:
+        for c in row_cells:
+            if c["column"] == header_col and not _is_empty_value(c["value"]):
+                candidates.append(_safe_str(c["value"]).strip())
+                break
+
+    text_values = [
+        _safe_str(c["value"]).strip()
+        for c in row_cells
+        if _is_text_like(c["value"])
+    ]
+
+    if text_values:
+        candidates.append(text_values[0])
+        if len(text_values) >= 2:
+            candidates.append(" | ".join(text_values[:2]))
+        if len(text_values) >= 3:
+            candidates.append(" | ".join(text_values[:3]))
+
+    # även blandade rader som t.ex. "2019 | Energi | kWh"
+    mixed_values = [_safe_str(c["value"]).strip() for c in row_cells[:4] if not _is_empty_value(c["value"])]
+    if mixed_values:
+        candidates.append(" | ".join(mixed_values))
+
+    out = []
+    seen = set()
+    for cand in candidates:
+        norm = _normalize_text(cand)
+        if norm and norm not in seen:
+            seen.add(norm)
+            out.append(cand)
+
+    return out
+
+
+def _build_region(
+    region_id: str,
+    cells: List[Dict[str, Any]],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    col_map: Dict[int, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    rows_sorted = sorted({c["row"] for c in cells})
+    cols_sorted = sorted({c["column"] for c in cells})
+
+    row_start, row_end = rows_sorted[0], rows_sorted[-1]
+    col_start, col_end = cols_sorted[0], cols_sorted[-1]
+
+    header_row, header_row_score = _find_best_header_row(
+        rows_sorted=rows_sorted,
+        row_map=row_map,
+        col_start=col_start,
+        col_end=col_end,
+    )
+    header_col, header_col_score = _find_best_header_col(
+        cols_sorted=cols_sorted,
+        col_map=col_map,
+        row_map=row_map,
+        row_start=row_start,
+        row_end=row_end,
+    )
+
+    table_score = _table_candidate_score(
+        cells=cells,
+        header_row_score=header_row_score,
+        header_col_score=header_col_score,
+    )
+
+    stats = _band_stats(cells)
+
+    # kolumnmetadata
+    header_row_cells = {
+        c["column"]: c
+        for c in _row_cells_in_bounds(row_map.get(header_row, []), col_start, col_end)
+    } if header_row is not None else {}
+
+    columns_meta = []
+    for col_nr in cols_sorted:
+        header_label = None
+        normalized_header_label = None
+
+        if col_nr in header_row_cells:
+            header_label = _safe_str(header_row_cells[col_nr]["value"]).strip() or None
+            normalized_header_label = _normalize_text(header_label) if header_label else None
+
+        columns_meta.append({
+            "column_nr": col_nr,
+            "column_letter": get_column_letter(col_nr),
+            "kind": "header_column" if header_col == col_nr else "data_column",
+            "label": header_label,
+            "normalized_label": normalized_header_label,
+        })
+
+    # radmetadata
+    rows_meta = []
+    row_label_map = defaultdict(list)
+    column_label_map = defaultdict(list)
+
+    for col_meta in columns_meta:
+        if col_meta["normalized_label"]:
+            column_label_map[col_meta["normalized_label"]].append({
+                "region_id": region_id,
+                "column_nr": col_meta["column_nr"],
+                "column_letter": col_meta["column_letter"],
+                "label": col_meta["label"],
+            })
+
+    data_rows = [r for r in rows_sorted if header_row is None or r > header_row]
+
+    for row_nr in rows_sorted:
+        row_cells = _row_cells_in_bounds(row_map.get(row_nr, []), col_start, col_end)
+        label_candidates = _row_label_candidates(row_cells, header_col=header_col)
+
+        normalized_candidates = []
+        for cand in label_candidates:
+            norm = _normalize_text(cand)
+            if norm:
+                normalized_candidates.append(norm)
+                row_label_map[norm].append({
+                    "region_id": region_id,
+                    "row_nr": row_nr,
+                    "label": cand,
+                })
+
+        rows_meta.append({
+            "row_nr": row_nr,
+            "kind": (
+                "header_row" if header_row == row_nr
+                else "data_row" if row_nr in data_rows
+                else "row"
+            ),
+            "label_candidates": label_candidates,
+            "normalized_label_candidates": sorted(set(normalized_candidates)),
+        })
+
+    region_cells = []
+    for c in sorted(cells, key=lambda x: (x["row"], x["column"])):
+        region_cells.append({
+            "row": c["row"],
+            "column": c["column"],
+            "column_letter": c["column_letter"],
+            "value": c["value"],
+            "value_num": c["value_num"],
+            "data_type": c["data_type"],
+        })
+
+    return {
+        "region_id": region_id,
+        "region_type": "table_region",
+        "bounds": {
+            "row_start": row_start,
+            "row_end": row_end,
+            "col_start": col_start,
+            "col_end": col_end,
+        },
+        "shape": {
+            "row_count": stats["row_count"],
+            "col_count": stats["col_count"],
+            "non_empty_cell_count": len(cells),
+        },
+        "scores": {
+            "table_candidate_score": round(table_score, 4),
+            "header_row_score": round(header_row_score, 4),
+            "header_col_score": round(header_col_score, 4),
+        },
+        "confidence": round(min(table_score / 5.0, 0.99), 4),
+        "header_row_indices": [header_row] if header_row is not None else [],
+        "header_column_indices": [header_col] if header_col is not None else [],
+        "data_row_start": (header_row + 1) if header_row is not None else row_start,
+        "rows": rows_meta,
+        "columns": columns_meta,
+        "cells": region_cells,
+        "lookup_index": {
+            "row_label_map": dict(sorted(row_label_map.items())),
+            "column_label_map": dict(sorted(column_label_map.items())),
+        },
+    }
+
+
+def _split_prefix_context_if_needed(
+    cells: List[Dict[str, Any]],
+    row_map: Dict[int, List[Dict[str, Any]]],
+    header_row: Optional[int],
+    col_start: int,
+    col_end: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if header_row is None:
+        return [], cells
+
+    rows_sorted = sorted({c["row"] for c in cells})
+    prefix_rows = [r for r in rows_sorted if r < header_row]
+    if not prefix_rows:
+        return [], cells
+
+    prefix_cells = [c for c in cells if c["row"] in prefix_rows]
+    body_cells = [c for c in cells if c["row"] >= header_row]
+
+    if not prefix_cells or not body_cells:
+        return [], cells
+
+    prefix_numeric_ratio = sum(c["value_num"] is not None for c in prefix_cells) / max(len(prefix_cells), 1)
+    prefix_row_density = len(prefix_cells) / max(len(prefix_rows), 1)
+
+    # konservativ split: bara om prefix tydligt ser ut som kontext
+    if prefix_numeric_ratio < 0.15 and prefix_row_density <= 2.2:
+        return prefix_cells, body_cells
+
+    return [], cells
+
+
+def _detect_regions_and_context(sparse_sheet: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cells = sparse_sheet["cells"]
+    row_map = sparse_sheet["row_map"]
+    col_map = sparse_sheet["col_map"]
+
+    if not cells:
+        return [], []
+
+    occupied_rows = sorted(row_map.keys())
+    row_groups = _group_contiguous(occupied_rows, gap= MAX_EMPTY_ROW_GAP+1)
+
+    regions = []
+    context_blocks = []
+    covered_coords = set()
+    region_counter = 0
+    context_counter = 0
+
+    for row_group in row_groups:
+        band_cells = [c for c in cells if c["row"] in row_group]
+        band_cols = sorted({c["column"] for c in band_cells})
+
+        if not band_cols:
+            continue
+
+        col_groups = _group_contiguous(band_cols, gap=MAX_EMPTY_COL_GAP + 1)
+
+        for col_group in col_groups:
+            row_start, row_end = min(row_group), max(row_group)
+            col_start, col_end = min(col_group), max(col_group)
+
+            sub_cells = _cells_within_bounds(
+                cells=band_cells,
+                row_start=row_start,
+                row_end=row_end,
+                col_start=col_start,
+                col_end=col_end,
+            )
+            if not sub_cells:
+                continue
+
+            rows_sorted = sorted({c["row"] for c in sub_cells})
+            cols_sorted = sorted({c["column"] for c in sub_cells})
+
+            header_row, header_row_score = _find_best_header_row(
+                rows_sorted=rows_sorted,
+                row_map=row_map,
+                col_start=col_start,
+                col_end=col_end,
+            )
+            header_col, header_col_score = _find_best_header_col(
+                cols_sorted=cols_sorted,
+                col_map=col_map,
+                row_map=row_map,
+                row_start=row_start,
+                row_end=row_end,
+            )
+
+            table_score = _table_candidate_score(
+                cells=sub_cells,
+                header_row_score=header_row_score,
+                header_col_score=header_col_score,
+            )
+
+            prefix_cells, maybe_table_cells = _split_prefix_context_if_needed(
+                cells=sub_cells,
+                row_map=row_map,
+                header_row=header_row,
+                col_start=col_start,
+                col_end=col_end,
+            )
+
+            # uppdatera score efter split om vi skapade prefix-kontext
+            if maybe_table_cells != sub_cells:
+                sub_cells = maybe_table_cells
+                rows_sorted = sorted({c["row"] for c in sub_cells})
+                cols_sorted = sorted({c["column"] for c in sub_cells})
+
+                header_row, header_row_score = _find_best_header_row(
+                    rows_sorted=rows_sorted,
+                    row_map=row_map,
+                    col_start=min(cols_sorted),
+                    col_end=max(cols_sorted),
+                )
+                header_col, header_col_score = _find_best_header_col(
+                    cols_sorted=cols_sorted,
+                    col_map=col_map,
+                    row_map=row_map,
+                    row_start=min(rows_sorted),
+                    row_end=max(rows_sorted),
+                )
+                table_score = _table_candidate_score(
+                    cells=sub_cells,
+                    header_row_score=header_row_score,
+                    header_col_score=header_col_score,
+                )
+
+            if prefix_cells:
+                context_counter += 1
+                context_blocks.append(
+                    _extract_context_block(prefix_cells, block_id=f"ctx_{context_counter}")
+                )
+                for c in prefix_cells:
+                    covered_coords.add((c["row"], c["column"]))
+
+            if table_score >= 2.8 and len(rows_sorted) >= 2 and len(cols_sorted) >= 2:
+                region_counter += 1
+                region = _build_region(
+                    region_id=f"r{region_counter}",
+                    cells=sub_cells,
+                    row_map=row_map,
+                    col_map=col_map,
+                )
+                regions.append(region)
+                for c in sub_cells:
+                    covered_coords.add((c["row"], c["column"]))
+            else:
+                # ej tillräckligt tabell-lik -> kontext
+                leftovers = [c for c in sub_cells if (c["row"], c["column"]) not in covered_coords]
+                if leftovers:
+                    context_counter += 1
+                    context_blocks.append(
+                        _extract_context_block(leftovers, block_id=f"ctx_{context_counter}")
+                    )
+                    for c in leftovers:
+                        covered_coords.add((c["row"], c["column"]))
+
+    # eventuella kvarvarande celler som varken blev region eller prefix-kontext
+    remaining = [c for c in cells if (c["row"], c["column"]) not in covered_coords]
+    if remaining:
+        remaining_rows = sorted({c["row"] for c in remaining})
+        for rg in _group_contiguous(remaining_rows, gap= MAX_EMPTY_ROW_GAP + 1):
+            block_cells = [c for c in remaining if c["row"] in rg]
+            if block_cells:
+                context_counter += 1
+                context_blocks.append(
+                    _extract_context_block(block_cells, block_id=f"ctx_{context_counter}")
+                )
+
+    return regions, context_blocks
+
+
+def _aggregate_lookup_index(
+    table_regions: List[Dict[str, Any]],
+    context_blocks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    row_label_map = defaultdict(list)
+    column_label_map = defaultdict(list)
+    context_term_map = defaultdict(list)
+
+    for region in table_regions:
+        r_index = region.get("lookup_index", {}) or {}
+
+        for key, hits in (r_index.get("row_label_map") or {}).items():
+            row_label_map[key].extend(hits)
+
+        for key, hits in (r_index.get("column_label_map") or {}).items():
+            column_label_map[key].extend(hits)
+
+    for block in context_blocks:
+        for term in block.get("normalized_terms", []) or []:
+            if term:
+                context_term_map[term].append({
+                    "block_id": block["block_id"],
+                    "region_type": block["region_type"],
+                })
+
+    return {
+        "row_label_map": dict(sorted(row_label_map.items())),
+        "column_label_map": dict(sorted(column_label_map.items())),
+        "context_term_map": dict(sorted(context_term_map.items())),
+    }
+
+
+def enrich_sheet_json(sheet_dict: Dict[str, Any]) -> Dict[str, Any]:
+    raw_json = sheet_dict.get("JSON")
+    if not raw_json:
+        return sheet_dict
+
+    raw_payload = json.loads(raw_json)
+    sparse_sheet = _build_sparse_sheet(raw_payload)
+
+    table_regions, context_blocks = _detect_regions_and_context(sparse_sheet)
+    lookup_index = _aggregate_lookup_index(table_regions, context_blocks)
+
+    enriched_payload = {
+        "schema_version": ANATOMY_SCHEMA_VERSION,
+        "sheet": {
+            "sheet_name": sparse_sheet["sheet_meta"].get("sheet_name"),
+            "sheet_nr": int(sheet_dict.get("sheet_nr") or 0),
+            "max_row": sparse_sheet["sheet_meta"].get("max_row"),
+            "max_column": sparse_sheet["sheet_meta"].get("max_column"),
+            "headerRowCount": sparse_sheet["sheet_meta"].get("headerRowCount"),
+        },
+        "stats": {
+            "raw_non_empty_cell_count": len(sparse_sheet["cells"]),
+            "table_region_count": len(table_regions),
+            "context_block_count": len(context_blocks),
+        },
+        "table_regions": table_regions,
+        "context_blocks": context_blocks,
+        "lookup_index": lookup_index,
+    }
+
+    out = dict(sheet_dict)
+    out["JSON_raw"] = raw_json
+    out["JSON"] = json.dumps(enriched_payload, ensure_ascii=False, indent=2)
+    out["anatomy_schema_version"] = ANATOMY_SCHEMA_VERSION
+    out["table_region_count"] = len(table_regions)
+    out["context_block_count"] = len(context_blocks)
+
+    return out
+
+
+# ---- Run enrichment over json_sheets
+json_sheets = [enrich_sheet_json(sheet) for sheet in json_sheets]
+
+print(f"Anatomy enrichment complete for {len(json_sheets)} sheets")
+
+for item in json_sheets:
+    print(
+        f"sheet_nr={item['sheet_nr']} | "
+        f"Sheet_name={item['Sheet_name']} | "
+        f"sheet_id={item['sheet_id']} | "
+        f"table_regions={item.get('table_region_count', 0)} | "
+        f"context_blocks={item.get('context_block_count', 0)} | "
+        f"json_chars={len(item['JSON'])}"
+    )
+
+# preview last enriched JSON
+print(json_sheets[0]["JSON"])
+# 2.2 Compaction
+# Drop-in cell: kör direkt efter "2.1 Anatomy enrichment"
+# Syfte:
+# - remove empty cells
+# - remove full style dump
+# - keep sparse cells only
+# - keep enriched structure only
+
+COMPACTION_SCHEMA_VERSION = "sheet_table_regions_v1_compact"
+REMOVE_DEBUG_FIELDS_FROM_SHEET_DICT = True
+
+
+def _compact_bounds(bounds: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(bounds, dict):
+        return {}
+    return {
+        "row_start": bounds.get("row_start"),
+        "row_end": bounds.get("row_end"),
+        "col_start": bounds.get("col_start"),
+        "col_end": bounds.get("col_end"),
+    }
+
+
+def _compact_text_lines(lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for line in lines or []:
+        row_nr = line.get("row_nr")
+        text = _safe_str(line.get("text")).strip()
+        if row_nr is None or not text:
+            continue
+        out.append({
+            "row_nr": int(row_nr),
+            "text": text,
+        })
+    return out
+
+
+def _compact_region_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for row in rows or []:
+        row_nr = row.get("row_nr")
+        if row_nr is None:
+            continue
+
+        item = {
+            "row_nr": int(row_nr),
+            "kind": row.get("kind"),
+            "normalized_label_candidates": sorted(
+                {
+                    _normalize_text(x)
+                    for x in (row.get("normalized_label_candidates") or [])
+                    if _normalize_text(x)
+                }
+            ),
+        }
+
+        raw_candidates = [
+            _safe_str(x).strip()
+            for x in (row.get("label_candidates") or [])
+            if _safe_str(x).strip()
+        ]
+        if raw_candidates:
+            item["label_candidates"] = raw_candidates
+
+        out.append(item)
+
+    return out
+
+
+def _compact_region_columns(columns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for col in columns or []:
+        col_nr = col.get("column_nr")
+        if col_nr is None:
+            continue
+
+        item = {
+            "column_nr": int(col_nr),
+            "column_letter": col.get("column_letter") or get_column_letter(int(col_nr)),
+            "kind": col.get("kind"),
+        }
+
+        label = _safe_str(col.get("label")).strip()
+        normalized_label = _normalize_text(col.get("normalized_label"))
+
+        if label:
+            item["label"] = label
+        if normalized_label:
+            item["normalized_label"] = normalized_label
+
+        out.append(item)
+
+    return out
+
+
+def _compact_region_cells(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+
+    for cell in cells or []:
+        value = cell.get("value")
+        if _is_empty_value(value):
+            continue
+
+        row_nr = cell.get("row")
+        col_nr = cell.get("column")
+        if row_nr is None or col_nr is None:
+            continue
+
+        item = {
+            "row": int(row_nr),
+            "column": int(col_nr),
+            "column_letter": cell.get("column_letter") or get_column_letter(int(col_nr)),
+            "value": value,
+        }
+
+        value_num = cell.get("value_num")
+        if value_num is not None:
+            item["value_num"] = value_num
+
+        data_type = cell.get("data_type")
+        if data_type not in (None, ""):
+            item["data_type"] = data_type
+
+        out.append(item)
+
+    out.sort(key=lambda x: (x["row"], x["column"]))
+    return out
+
+
+def _dedupe_hit_list(hit_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    seen = set()
+
+    for hit in hit_list or []:
+        if not isinstance(hit, dict):
+            continue
+
+        key = (
+            hit.get("region_id"),
+            hit.get("row_nr"),
+            hit.get("column_nr"),
+            hit.get("column_letter"),
+            hit.get("label"),
+            hit.get("block_id"),
+            hit.get("region_type"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        compact_hit = {}
+        for k in ("region_id", "row_nr", "column_nr", "column_letter", "label", "block_id", "region_type"):
+            if hit.get(k) not in (None, "", [], {}):
+                compact_hit[k] = hit.get(k)
+
+        out.append(compact_hit)
+
+    return out
+
+
+def _compact_lookup_map(m: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for key, hits in (m or {}).items():
+        norm_key = _normalize_text(key)
+        if not norm_key:
+            continue
+
+        deduped_hits = _dedupe_hit_list(hits)
+        if deduped_hits:
+            out[norm_key] = deduped_hits
+
+    return dict(sorted(out.items()))
+
+
+def _compact_region_lookup_index(region_lookup: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "row_label_map": _compact_lookup_map(region_lookup.get("row_label_map") or {}),
+        "column_label_map": _compact_lookup_map(region_lookup.get("column_label_map") or {}),
+    }
+
+
+def _compact_table_region(region: Dict[str, Any]) -> Dict[str, Any]:
+    compact_region = {
+        "region_id": region.get("region_id"),
+        "region_type": "table_region",
+        "bounds": _compact_bounds(region.get("bounds") or {}),
+        "header_row_indices": [int(x) for x in (region.get("header_row_indices") or []) if x is not None],
+        "header_column_indices": [int(x) for x in (region.get("header_column_indices") or []) if x is not None],
+        "data_row_start": region.get("data_row_start"),
+        "rows": _compact_region_rows(region.get("rows") or []),
+        "columns": _compact_region_columns(region.get("columns") or []),
+        "cells": _compact_region_cells(region.get("cells") or []),
+        "lookup_index": _compact_region_lookup_index(region.get("lookup_index") or {}),
+    }
+
+    return compact_region
+
+
+def _compact_context_block(block: Dict[str, Any]) -> Dict[str, Any]:
+    terms = sorted(
+        {
+            _normalize_text(x)
+            for x in (block.get("normalized_terms") or [])
+            if _normalize_text(x)
+        }
+    )
+
+    return {
+        "block_id": block.get("block_id"),
+        "region_type": "context_block",
+        "bounds": _compact_bounds(block.get("bounds") or {}),
+        "text_lines": _compact_text_lines(block.get("text_lines") or []),
+        "normalized_terms": terms,
+    }
+
+
+def compact_enriched_sheet_json(sheet_dict: Dict[str, Any]) -> Dict[str, Any]:
+    raw_json = sheet_dict.get("JSON")
+    if not raw_json:
+        return sheet_dict
+
+    payload = json.loads(raw_json)
+
+    # Om JSON inte kommer från anatomy enrichment, låt den vara
+    if payload.get("schema_version") not in {
+        ANATOMY_SCHEMA_VERSION,
+        COMPACTION_SCHEMA_VERSION,
+    }:
+        return sheet_dict
+
+    table_regions = [
+        _compact_table_region(region)
+        for region in (payload.get("table_regions") or [])
+    ]
+
+    context_blocks = [
+        _compact_context_block(block)
+        for block in (payload.get("context_blocks") or [])
+    ]
+
+    compact_payload = {
+        "schema_version": COMPACTION_SCHEMA_VERSION,
+        "sheet": {
+            "sheet_name": (payload.get("sheet") or {}).get("sheet_name"),
+            "sheet_nr": (payload.get("sheet") or {}).get("sheet_nr"),
+            "max_row": (payload.get("sheet") or {}).get("max_row"),
+            "max_column": (payload.get("sheet") or {}).get("max_column"),
+        },
+        "stats": {
+            "table_region_count": len(table_regions),
+            "context_block_count": len(context_blocks),
+            "sparse_cell_count": sum(len(r.get("cells") or []) for r in table_regions),
+        },
+        "table_regions": table_regions,
+        "context_blocks": context_blocks,
+        "lookup_index": {
+            "row_label_map": _compact_lookup_map((payload.get("lookup_index") or {}).get("row_label_map") or {}),
+            "column_label_map": _compact_lookup_map((payload.get("lookup_index") or {}).get("column_label_map") or {}),
+            "context_term_map": _compact_lookup_map((payload.get("lookup_index") or {}).get("context_term_map") or {}),
+        },
+    }
+
+    out = dict(sheet_dict)
+    out["JSON"] = json.dumps(compact_payload, ensure_ascii=False, indent=2)
+    out["anatomy_schema_version"] = COMPACTION_SCHEMA_VERSION
+    out["table_region_count"] = len(table_regions)
+    out["context_block_count"] = len(context_blocks)
+
+    if REMOVE_DEBUG_FIELDS_FROM_SHEET_DICT:
+        out.pop("JSON_raw", None)
+
+    return out
+
+
+# ---- Run compaction over json_sheets
+json_sheets = [compact_enriched_sheet_json(sheet) for sheet in json_sheets]
+
+print(f"Compaction complete for {len(json_sheets)} sheets")
+
+for item in json_sheets:
+    print(
+        f"sheet_nr={item['sheet_nr']} | "
+        f"Sheet_name={item['Sheet_name']} | "
+        f"sheet_id={item['sheet_id']} | "
+        f"table_regions={item.get('table_region_count', 0)} | "
+        f"context_blocks={item.get('context_block_count', 0)} | "
+        f"json_chars={len(item['JSON'])}"
+    )
+
+# preview last compacted JSON
+print(json_sheets[-1]["JSON"])
+# 3 Sheets[] --> Delta table
+
+# ---- Preconditions
+sheet_list = None
+if "sheets" in globals() and sheets:
+    sheet_list = sheets
+elif "json_sheets" in globals() and json_sheets:
+    sheet_list = json_sheets
+else:
+    raise RuntimeError("Neither `sheets` nor `json_sheets` was found or contained data.")
+
+if "DOC_PATH" not in globals() or not DOC_PATH:
+    raise RuntimeError("DOC_PATH not found.")
+
+# ---- Target table
+catalog = "dev"
+schema = "acquisition_intelligence"
+table = DELTA_TABLE
+table_fqn = f"{catalog}.{schema}.{table}"
+
+spark.sql(f"USE CATALOG `{catalog}`")
+spark.sql(f"USE SCHEMA `{schema}`")
+
+# ---- Build rows from sheets list
+doc_id = os.path.basename(DOC_PATH)
+rows = []
+
+for sheet in sheet_list:
+    sheet_name = sheet.get("sheet_name", sheet.get("Sheet_name"))
+    markdown = sheet.get("Markdown", sheet.get("markdown"))
+    json = sheet.get("JSON", sheet.get("json"))
+
+    rows.append({
+        "doc_id": doc_id,
+        "element_id": sheet["sheet_id"],
+        "element_type": "Sheet",          # <- must NOT be None
+        "raw_text": markdown,
+        "raw_table": json,
+        "page": int(sheet["sheet_nr"]),
+        "source_name": DOC_PATH,
+        "element_title": sheet_name,
+    })
+
+if not rows:
+    raise RuntimeError("No rows were created from the sheets list.")
+
+# ---- Create dataframe
+out_schema = StructType([
+    StructField("doc_id", StringType(), nullable=False),
+    StructField("element_id", StringType(), nullable=False),
+    StructField("element_type", StringType(), nullable=False),
+    StructField("raw_text", StringType(), nullable=True),
+    StructField("raw_table", StringType(), nullable=True),
+    StructField("page", IntegerType(), nullable=True),
+    StructField("source_name", StringType(), nullable=True),
+    StructField("element_title", StringType(), nullable=True),
+])
+
+df_out = spark.createDataFrame(rows, schema=out_schema)
+
+# ---- Insert only requested columns
+tmp_view = "tmp_sheet_rows_for_DELTA_TABLE"
+df_out.createOrReplaceTempView(tmp_view)
+
+try:
+    spark.sql(f"""
+        INSERT INTO {table_fqn}
+        (doc_id, element_id, element_type, raw_text, raw_table, page, source_name, element_title)
+        SELECT
+            doc_id,
+            element_id,
+            element_type,
+            raw_text,
+            raw_table,
+            page,
+            source_name,
+            element_title
+        FROM {tmp_view}
+    """)
+
+    print(f"Successful: wrote {len(rows)} sheet rows to {table_fqn}")
+
+except Exception as e:
+    print(f"Write failed for {table_fqn}: {e}")
+    raise
+# 3.1 JSON --> sheet_summary + store in "sheet_summary.txt"
+
+doc_id = os.path.basename(DOC_PATH)
+
+# ---- Preconditions
+if "json_sheets" not in globals() or not json_sheets:
+    raise RuntimeError("json_sheets not found or empty. Run the Excel -> JSON cell first.")
+
+MODEL_ENDPOINT = "databricks-claude-sonnet-4-6"
+sheets = json_sheets
+summaries = ""
+prompt = "Skriv en sammanfattning om följande JSON text extraherad från ett excel blad. Svara endast i text, ingen markdown."
+
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+workspace_url = ctx.apiUrl().get()
+api_token = ctx.apiToken().get()
+
+invoke_url = f"{workspace_url}/serving-endpoints/{MODEL_ENDPOINT}/invocations"
+headers = {
+    "Authorization": f"Bearer {api_token}",
+    "Content-Type": "application/json",
+}
+
+def extract_text(resp_json: dict) -> str:
+    choices = resp_json.get("choices", [])
+    if not choices:
+        return ""
+
+    msg = choices[0].get("message", {})
+    content = msg.get("content", "")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts).strip()
+
+    return str(content).strip()
+
+for i, sheet in enumerate(sheets, start=1):
+    try:
+        JSON = sheet["JSON"]
+
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Du kommer att få JSON som extraherats från ett Excel-blad."
+
+                        "Din uppgift är att skriva en kort men stark retrieval-optimerad sammanfattning för similarity search på svenska."
+                        "Texten ska hjälpa en RAG-agent att hitta rätt Excel-blad när användaren söker efter innehåll, tabeller, värden, tidsperioder, ämnen eller nyckelbegrepp."
+
+                        "VIKTIGT:"
+                        "- Skriv ENDAST ren text, ingen markdown."
+                        "- Skriv på svenska."
+                        "- Var konkret, kompakt och informationsrik."
+                        "- Undvik muntlig/pratig ton."
+                        "- Prioritera sökbarhet och semantisk träffsäkerhet framför snygg prosa."
+                        "- Beskriv vad bladet innehåller, vilken typ av data det är, vilka entiteter/ämnen som förekommer, tidsperioder, enheter, viktiga rader/kolumner och vad användaren sannolikt skulle söka efter."
+                        "- Nämn centrala nyckelord och synonymer om de är relevanta, till exempel både energiförbrukning och fjärrvärmeförbrukning om bladet handlar om det."
+                        "- Om JSON innehåller tabellstruktur, nämn vilka dimensioner som organiserar datan, till exempel år, månader, konton, kostnadsslag, objekt, mätvärden eller kategorier."
+                        "- Om specifika belopp, volymer, enheter eller datum tydligt framgår ska de nämnas."
+                        "- Hallucinera inte. Skriv bara sådant som stöds av JSON."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{prompt}\n\n"
+                        f"Document: {doc_id}\n"
+                        f"Sheet name: {sheet['Sheet_name']}\n\n"
+                        f"JSON:\n{JSON}"
+                    )
+                }
+            ],
+            "max_tokens": 800,
+            "temperature": 0.1,
+        }
+
+        response = requests.post(invoke_url, headers=headers, json=payload, timeout=180)
+        response.raise_for_status()
+        response_json = response.json()
+
+        summary_text = extract_text(response_json)
+
+        summaries += (
+            f"sheet_nr: {sheet['sheet_nr']}\n"
+            f"sheet_id: {sheet['sheet_id']}\n"
+            f"document: {doc_id}\n"
+            f"sheet_name: {sheet['Sheet_name']}\n"
+            f"summary:\n{summary_text}\n"
+            f"{'-'*80}\n"
+        )
+
+        print(f"sheet {i} summary successful")
+
+    except Exception as e:
+        print(f"sheet {i} summary failed: {e}")
+
+print("\nFULL SUMMARIES:\n")
+print(summaries)
+
+# ---- Save summaries to OUT_PATH/sheet_summaries.txt
+if "OUT_PATH" not in globals() or not OUT_PATH:
+    raise RuntimeError("OUT_PATH not found or empty.")
+
+os.makedirs(OUT_PATH, exist_ok=True)
+
+SUMMARY_TXT_PATH = os.path.join(OUT_PATH, "sheet_summary.txt")
+
+with open(SUMMARY_TXT_PATH, "w", encoding="utf-8") as f:
+    f.write(summaries)
+
+print(f"Saved sheet summaries to: {SUMMARY_TXT_PATH}")
+# 3.2 sheet_summaries.txt --> Delta Table summary_text
+
+# ---- Preconditions
+if "OUT_PATH" not in globals() or not OUT_PATH:
+    raise RuntimeError("OUT_PATH not found or empty.")
+
+
+catalog = "dev"
+schema = "acquisition_intelligence"
+table = DELTA_TABLE
+table_fqn = f"{catalog}.{schema}.{table}"
+
+spark.sql(f"USE CATALOG `{catalog}`")
+spark.sql(f"USE SCHEMA `{schema}`")
+
+
+# 1) Create dictionary
+sheet_summaries = {}
+
+# ---- Find summary txt file
+candidate_paths = [
+    os.path.join(OUT_PATH, "sheet_summaries.txt"),
+    os.path.join(OUT_PATH, "sheet_summary.txt"),
+]
+
+summary_txt_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+
+if not summary_txt_path:
+    raise FileNotFoundError(
+        f"Could not find sheet summaries file in OUT_PATH. Looked for: {candidate_paths}"
+    )
+
+# 2) Open txt file and extract sheet_id -> summary text
+with open(summary_txt_path, "r", encoding="utf-8") as f:
+    txt = f.read()
+
+# Matches blocks like:
+# sheet_nr: 1
+# sheet_id: abc123
+# sheet_name: My sheet
+# summary:
+# ...
+# --------------------------------------------------------------------------------
+pattern = re.compile(
+    r"sheet_nr:\s*\d+\s*"
+    r"sheet_id:\s*(?P<sheet_id>[^\n]+)\s*"
+    r"(?:document:\s*(?P<document>[^\n]+)\s*)?"
+    r"(?:doc_id:\s*(?P<doc_id>[^\n]+)\s*)?"
+    r"sheet_name:\s*(?P<sheet_name>[^\n]*)\s*"
+    r"summary:\s*\n(?P<summary>.*?)(?=\n-+\n|\Z)",
+    re.DOTALL
+)
+
+
+
+for m in pattern.finditer(txt):
+    sheet_id = m.group("sheet_id").strip()
+    summary = (
+        f"document: {(m.group('document') or m.group('doc_id') or '').strip()}\n"
+        f"sheet_name: {(m.group('sheet_name') or '').strip()}\n"
+        f"{m.group('summary').strip()}"
+        ).strip()
+    if sheet_id:
+        sheet_summaries[sheet_id] = summary
+
+if not sheet_summaries:
+    raise RuntimeError(f"No sheet summaries could be parsed from: {summary_txt_path}")
+
+print(f"Parsed {len(sheet_summaries)} sheet summaries from: {summary_txt_path}")
+
+# 3) Update matching rows in delta table
+update_rows = [{"element_id": k, "summary_text": v} for k, v in sheet_summaries.items()]
+
+update_schema = StructType([
+    StructField("element_id", StringType(), nullable=False),
+    StructField("summary_text", StringType(), nullable=True),
+])
+
+updates_df = spark.createDataFrame(update_rows, schema=update_schema)
+updates_view = "tmp_sheet_summary_updates"
+updates_df.createOrReplaceTempView(updates_view)
+
+# Optional: count how many element_ids actually exist before update
+match_count = spark.sql(f"""
+    SELECT COUNT(*) AS n
+    FROM {table_fqn} t
+    INNER JOIN {updates_view} u
+        ON t.element_id = u.element_id
+""").collect()[0]["n"]
+
+spark.sql(f"""
+    MERGE INTO {table_fqn} AS t
+    USING {updates_view} AS u
+    ON t.element_id = u.element_id
+    WHEN MATCHED THEN
+      UPDATE SET t.summary_text = u.summary_text
+""")
+
+# 4) Print status
+print(f"Successful: updated {match_count} rows in {table_fqn}.")
+print(f"Parsed summaries: {len(sheet_summaries)}")
+print(f"Matched element_id rows: {match_count}")
